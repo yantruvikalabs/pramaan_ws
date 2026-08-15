@@ -33,7 +33,7 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { sign } from './signing.js';
-import { query } from '../db.js';
+import { col } from '../db/mongo.js';
 import { config } from '../config.js';
 
 /**
@@ -54,10 +54,9 @@ export async function publishHead(head, destination) {
 
   // 1 — the index. Never the publication.
   try {
-    await query(
-      'INSERT INTO published_heads (seq, hash, signature, destination) VALUES (?,?,?,?)',
-      [head.seq, head.hash, signature, destination],
-    );
+    await col('published_heads').insertOne({
+      seq: head.seq, hash: head.hash, signature, destination, published_at: new Date(),
+    });
     sinks.index = true;
   } catch {
     // A failed index must not stop a real publication.

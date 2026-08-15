@@ -27,7 +27,7 @@ import {
 import { publicKeyForVerifiers } from '../lib/signing.js';
 import { publishHead, publishedHeadsFromFile, publishingPosture } from '../lib/heads.js';
 import { subjectRefFor, locationRefFor, locationFor } from '../lib/refs.js';
-import { query } from '../db.js';
+import { col } from '../db/mongo.js';
 import { config } from '../config.js';
 
 const submission = z.object({
@@ -223,12 +223,14 @@ export default function eventRoutes(app) {
    * cannot be attributed — which is exactly what erasure is meant to do.
    */
   app.get('/events/mine', requireAuth, async (req, res) => {
-    const rows = await query(
-      `SELECT * FROM events WHERE subject_ref =
-         (SELECT subject_ref FROM subject_refs WHERE employee_id = ?)
-        ORDER BY seq DESC LIMIT 100`,
-      [req.employee.employee_id],
-    );
+    // Two round trips where MySQL used a correlated subquery. A person with no
+    // mapping yet has no events, so an absent ref is an empty list, never a
+    // query for `subject_ref: null` — which would match every event that has
+    // no subject and hand this employee somebody else's records.
+    const mapping = await col('subject_refs').findOne({ employee_id: req.employee.employee_id });
+    const rows = mapping
+      ? await col('events').find({ subject_ref: mapping._id }).sort({ seq: -1 }).limit(100).toArray()
+      : [];
 
     const events = await Promise.all(rows.map(async (r) => ({
       seq: Number(r.seq),
@@ -245,10 +247,11 @@ export default function eventRoutes(app) {
   /** GET /quarantine — what could not be appended, and why. Admin only. */
   app.get('/quarantine', requireAuth, requireRole(ROLE.ADMIN), async (_req, res) => {
     res.json({
-      items: await query(
-        `SELECT id, event_id, reason, detail, session_ref, received_at, reviewed_at
-           FROM quarantine ORDER BY received_at DESC LIMIT 200`,
-      ),
+      items: await col('quarantine')
+        .find({}, { projection: { submission: 0 } })
+        .sort({ received_at: -1 })
+        .limit(200)
+        .toArray(),
     });
   });
 }

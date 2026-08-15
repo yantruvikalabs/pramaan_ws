@@ -8,7 +8,7 @@
 import jwt from 'jsonwebtoken';
 import { roleAtLeast } from '@pramaan/shared';
 import { config } from '../config.js';
-import { query } from '../db.js';
+import { getEmployee } from '../lib/employee-store.js';
 import {
   SESSION_STATE,
   END_REASON,
@@ -17,9 +17,6 @@ import {
   markExpired,
   touchSession,
 } from '../lib/sessions.js';
-
-const EMPLOYEE_COLUMNS =
-  'employee_id, name, phone, email, role, reports_to, status, language';
 
 export function signToken(payload) {
   return jwt.sign(payload, config.jwt.secret, { expiresIn: config.jwt.expiresIn });
@@ -96,12 +93,29 @@ export function authenticate({ allowDrainOnly = false } = {}) {
       return res.status(401).json({ error: 'SESSION_ENDED', message });
     }
 
-    const rows = await query(
-      `SELECT ${EMPLOYEE_COLUMNS} FROM employees WHERE employee_id = ?`,
-      [claims.sub],
-    );
-    const employee = rows[0];
+    // ⚠ Positively assert the state is one we recognise. The checks above
+    // reject by EXCLUSION, which was safe only because
+    // ENUM('ACTIVE','DRAIN_ONLY','REVOKED') made a fourth value
+    // unrepresentable. A JSON-Schema validator is not the same guarantee: a
+    // mis-cased 'revoked', a truncated write, or a document written through a
+    // path that skips validation would pass every check above and be treated
+    // as a live session that cannot be revoked.
+    //
+    // DRAIN_ONLY must still be permitted where the caller allows it — that is
+    // the ingest route, and refusing it would silently destroy attendance that
+    // exists only on a replaced handset (D-33). Fail closed on anything else.
+    const permitted =
+      session.state === SESSION_STATE.ACTIVE ||
+      (allowDrainOnly && session.state === SESSION_STATE.DRAIN_ONLY);
 
+    if (!permitted) {
+      return res.status(401).json({
+        error: 'SESSION_ENDED',
+        message: 'You were signed out. Sign in again.',
+      });
+    }
+
+    const employee = await getEmployee(claims.sub);
     if (!employee) return unauthenticated();
     if (employee.status === 'INACTIVE') {
       return res.status(403).json({

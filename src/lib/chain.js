@@ -20,7 +20,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { EVENT_TYPES } from '@pramaan/shared';
 import { canonicalBytes, CANON_VERSION } from './canonical.js';
 import { sign, verify } from './signing.js';
-import { getPool } from '../db.js';
+import { col, getClient, CHAIN_TXN_OPTIONS } from '../db/mongo.js';
+import { HEAD_ID } from '../db/mongo-schema.js';
+import { assertBsonSafe } from './bson-safe.js';
 
 export const GENESIS_HASH =
   'sha256:0000000000000000000000000000000000000000000000000000000000000000';
@@ -76,94 +78,180 @@ const iso = (d) => new Date(d).toISOString();
  *
  * Going through Date and back out via toISOString() re-normalises to three
  * decimal places always, which is the one format the chain uses.
+ *
+ * ⚠ Used ONLY by rowToEvent(), which now exists only for the migration tool.
+ *   The live read path is docToEvent(), and MongoDB stores these timestamps as
+ *   the exact ISO strings that were signed — deleting this conversion from the
+ *   running system rather than porting it, and with it the whole class of bug
+ *   described above.
  */
 const fromMysql = (value) => (value ? new Date(`${value.replace(' ', 'T')}Z`).toISOString() : null);
 
 /**
+ * We lost the race for this position. Not an error condition — retry.
+ *
+ * MySQL had no equivalent: `SELECT ... FOR UPDATE` on chain_head QUEUED
+ * concurrent appenders, so only one was ever inside the critical section.
+ * MongoDB has no row lock, so contention surfaces here instead of being
+ * absorbed by the database.
+ */
+class ChainRaceError extends Error {
+  constructor(seq) { super(`chain head moved past ${seq}`); this.name = 'ChainRaceError'; }
+}
+
+const isTransient = (err) =>
+  err?.hasErrorLabel?.('TransientTransactionError') ||
+  err?.hasErrorLabel?.('UnknownTransactionCommitResult') ||
+  err?.codeName === 'WriteConflict' || err?.code === 112;
+
+const isDuplicateKey = (err) => err?.code === 11000;
+
+/**
+ * An in-process queue in front of the appender — THROUGHPUT ONLY.
+ *
+ * Measured in D2: with 50 appends in flight the compare-and-swap loses often
+ * enough that each transaction body runs 8.86 times, and every run re-signs
+ * (the signature covers prev_hash, which changes on each retry, so the work
+ * cannot be hoisted out). Throughput fell from 104/s to 31/s while MySQL's row
+ * lock held a flat ~210/s, because InnoDB QUEUES contenders where MongoDB
+ * ABORTS them. Serialising locally turns that contention back into a queue.
+ *
+ * ⚠ NOT a correctness mechanism. It is confined to one Node process and
+ *   disappears during a rolling restart or with a second worker. The
+ *   compare-and-swap below is the guarantee, and test/chain-concurrency.mjs
+ *   runs every correctness pass with this queue DISABLED.
+ */
+let appendQueue = Promise.resolve();
+
+function serialise(fn) {
+  const run = appendQueue.then(fn, fn);
+  appendQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+/**
  * Append one event.
  *
- * Everything happens inside a transaction that holds a row lock on
- * chain_head, which is what makes `seq` gapless and `prev_hash` correct when
- * fifty phones upload at once. Deliberately NOT an AUTO_INCREMENT column: a
- * rolled-back transaction burns an auto-increment value and leaves a gap
- * that a verifier is right to read as a deleted record.
- *
- * @returns {{status:'appended'|'duplicate', event: object}}
+ * @param {object} input
+ * @param {import('mongodb').ClientSession|null} session
+ *   Passed only by a caller that owns an outer transaction. When it is, we do
+ *   NOT retry: the outer transaction is the unit of retry, and re-signing an
+ *   event into a transaction that is already doomed would be wrong.
+ * @param {{queue?: boolean, maxAttempts?: number, stats?: object}} opts
  */
-export async function appendEvent(input, conn = null) {
-  const owned = conn === null;
-  const c = conn ?? (await getPool().getConnection());
+export async function appendEvent(input, session = null, opts = {}) {
+  if (session !== null) return appendOnce(input, session, opts);
+  if (opts.queue === false) return appendWithRetry(input, opts);
+  return serialise(() => appendWithRetry(input, opts));
+}
 
-  try {
-    if (owned) await c.beginTransaction();
+async function appendWithRetry(input, opts = {}) {
+  const { maxAttempts = 25, stats = null } = opts;
+  const client = getClient();
 
-    // Idempotency first — a phone may re-send freely and must always be
-    // able to (BR-EVD-19). Checked inside the transaction so two concurrent
-    // deliveries of the same event cannot both get past it.
-    const [existing] = await c.execute(
-      'SELECT * FROM events WHERE event_id = ?',
-      [input.event_id],
-    );
-    if (existing.length > 0) {
-      if (owned) await c.commit();
-      return { status: 'duplicate', event: rowToEvent(existing[0]) };
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const session = client.startSession();
+    try {
+      let result = null;
+      await session.withTransaction(async () => {
+        result = await appendOnce(input, session, opts);
+      }, CHAIN_TXN_OPTIONS);
+      return result;
+    } catch (err) {
+      // Losing the race consumes nothing — the whole transaction rolled back,
+      // so no seq was burned. Retrying is correct behaviour, not a workaround.
+      if (err instanceof ChainRaceError || isTransient(err) || isDuplicateKey(err)) {
+        if (stats !== null) stats.retries = (stats.retries ?? 0) + 1;
+
+        // A duplicate event_id that was not visible at step 1 means a
+        // concurrent delivery of the SAME event won. That is a duplicate, not
+        // an error (BR-EVD-19) — throwing would fail an entire ingest batch
+        // for a punch that is perfectly fine.
+        if (isDuplicateKey(err)) {
+          const existing = await col('events').findOne({ event_id: input.event_id });
+          if (existing) return { status: 'duplicate', event: docToEvent(existing) };
+        }
+        if (attempt === maxAttempts) {
+          throw new Error(`append failed after ${maxAttempts} attempts: ${err.message}`);
+        }
+        // Jittered: without it, N appenders retry in lockstep and collide again.
+        await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 4 * attempt) + 1));
+        continue;
+      }
+      throw err;
+    } finally {
+      await session.endSession();
     }
-
-    const [heads] = await c.execute(
-      'SELECT seq, hash FROM chain_head WHERE id = 1 FOR UPDATE',
-    );
-    const head = heads[0] ?? { seq: 0, hash: GENESIS_HASH };
-
-    const event = {
-      seq: Number(head.seq) + 1,
-      event_id: input.event_id,
-      type: input.type,
-      subject_ref: input.subject_ref ?? null,
-      device_ref: input.device_ref ?? null,
-      session_ref: input.session_ref ?? null,
-      location_ref: input.location_ref ?? null,
-      payload: input.payload ?? {},
-      captured_at: input.captured_at ? iso(input.captured_at) : null,
-      received_at: iso(Date.now()),
-      device_time: input.device_time ?? null,
-      uptime_ms: input.uptime_ms ?? null,
-      prev_hash: head.hash,
-      canon_v: CANON_VERSION,
-    };
-
-    const bytes = canonicalBytes(envelopeOf(event));
-    event.hash = sha256(bytes);
-    event.signature = sign(bytes);
-
-    await c.execute(
-      `INSERT INTO events
-         (seq, event_id, type, subject_ref, device_ref, session_ref, location_ref,
-          payload, captured_at, received_at, device_time, uptime_ms,
-          canon_v, prev_hash, hash, signature)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [
-        event.seq, event.event_id, event.type, event.subject_ref, event.device_ref,
-        event.session_ref, event.location_ref, JSON.stringify(event.payload),
-        event.captured_at ? event.captured_at.slice(0, 23).replace('T', ' ') : null,
-        event.received_at.slice(0, 23).replace('T', ' '),
-        event.device_time, event.uptime_ms,
-        event.canon_v, event.prev_hash, event.hash, event.signature,
-      ],
-    );
-
-    await c.execute(
-      'UPDATE chain_head SET seq = ?, hash = ? WHERE id = 1',
-      [event.seq, event.hash],
-    );
-
-    if (owned) await c.commit();
-    return { status: 'appended', event };
-  } catch (err) {
-    if (owned) await c.rollback();
-    throw err;
-  } finally {
-    if (owned) c.release();
   }
+  throw new Error('unreachable');
+}
+
+async function appendOnce(input, session, opts = {}) {
+  if (opts.stats) opts.stats.bodyRuns = (opts.stats.bodyRuns ?? 0) + 1;
+
+  const events = col('events');
+  const heads = col('chain_head');
+
+  // 1 ── Idempotency first. A phone that lost signal mid-upload must always be
+  //      free to send everything again (BR-EVD-19).
+  const existing = await events.findOne({ event_id: input.event_id }, { session });
+  if (existing) return { status: 'duplicate', event: docToEvent(existing) };
+
+  // 2 ── The head is a CLAIM, not a fact: true only if the swap in step 4 matches.
+  const head = (await heads.findOne({ _id: HEAD_ID }, { session }))
+            ?? { seq: 0, hash: GENESIS_HASH };
+  const prevSeq = Number(head.seq);
+  if (!Number.isSafeInteger(prevSeq)) {
+    throw new Error(`chain head seq is not a safe integer: ${head.seq}`);
+  }
+
+  const event = {
+    seq: prevSeq + 1,
+    event_id: input.event_id,
+    type: input.type,
+    subject_ref: input.subject_ref ?? null,
+    device_ref: input.device_ref ?? null,
+    session_ref: input.session_ref ?? null,
+    location_ref: input.location_ref ?? null,
+    payload: input.payload ?? {},
+    captured_at: input.captured_at ? iso(input.captured_at) : null,
+    received_at: iso(Date.now()),
+    device_time: input.device_time ?? null,
+    uptime_ms: input.uptime_ms ?? null,
+    prev_hash: head.hash,
+    canon_v: CANON_VERSION,
+  };
+
+  // 3 ── Refuse what BSON cannot hold faithfully, BEFORE signing. D1 proved a
+  //      lone surrogate is silently replaced with U+FFFD; such an event would
+  //      read as ALTERED forever. It must be quarantined, never rewritten.
+  assertBsonSafe(event.payload, '$.payload');
+
+  const bytes = canonicalBytes(envelopeOf(event));
+  event.hash = sha256(bytes);
+  event.signature = sign(bytes);
+
+  // A test hook, and deliberately a narrow one: a boolean that throws at a
+  // single fixed point, not a caller-supplied callback that could do anything.
+  // It exists so test/chain-concurrency.mjs can prove the property that matters
+  // most — that a crash between signing and commit burns NO seq — against the
+  // real appender rather than a copy of it. No route passes this.
+  if (opts.failAfterSign) throw new Error('simulated crash between signing and commit');
+
+  // 4 ── THE LOCK. Conditional on the head not having moved since step 2.
+  //      matchedCount 0 means somebody else took this position.
+  const swap = await heads.updateOne(
+    { _id: HEAD_ID, seq: prevSeq },
+    { $set: { seq: event.seq, hash: event.hash, updated_at: new Date() } },
+    { session, upsert: false },
+  );
+  if (swap.matchedCount !== 1) throw new ChainRaceError(prevSeq);
+
+  // 5 ── _id IS seq: two events cannot occupy one position even if the swap
+  //      above is wrong. The second insert fails on the primary key.
+  await events.insertOne(toDoc(event), { session });
+
+  return { status: 'appended', event };
 }
 
 /**
@@ -183,12 +271,15 @@ export async function quarantine(
   conn = null,
   log = null,
 ) {
-  const c = conn ?? getPool();
-  await c.execute(
-    `INSERT INTO quarantine (event_id, reason, detail, submission, session_ref)
-     VALUES (?,?,?,?,?)`,
-    [eventId ?? null, reason, detail ?? null, JSON.stringify(submission ?? {}), sessionRef ?? null],
-  );
+  await col('quarantine').insertOne({
+    event_id: eventId ?? null,
+    reason,
+    detail: detail ?? null,
+    submission: submission ?? {},
+    session_ref: sessionRef ?? null,
+    received_at: new Date(),
+    reviewed_at: null,
+  }, conn ? { session: conn } : {});
 
   const alert = {
     alert: 'CHAIN_QUARANTINE',
@@ -204,13 +295,16 @@ export async function quarantine(
 
 /** How many are waiting for somebody to look at them. */
 export async function unreviewedQuarantine() {
-  const pool = getPool();
-  const [rows] = await pool.execute(
-    'SELECT COUNT(*) AS n FROM quarantine WHERE reviewed_at IS NULL',
-  );
-  return Number(rows[0]?.n ?? 0);
+  return col('quarantine').countDocuments({ reviewed_at: null });
 }
 
+/**
+ * A MySQL ROW → an event. Retained for tools/migrate-to-mongo.mjs only.
+ *
+ * The application no longer reads MySQL; do not use this on the live path.
+ * It is what makes the migration's byte-equality check meaningful, because it
+ * is the same mapper the application used when those events were written.
+ */
 function rowToEvent(row) {
   return {
     seq: Number(row.seq),
@@ -234,13 +328,79 @@ function rowToEvent(row) {
 
 export { rowToEvent };
 
+/**
+ * An event → its stored document.
+ *
+ * `_id` IS seq: two events cannot occupy one position even if the head
+ * compare-and-swap is wrong, because the second insert fails on the primary
+ * key. It also makes the seq-ordered read an index scan for free.
+ *
+ * ⚠ captured_at / received_at are stored as the EXACT ISO STRINGS THAT WERE
+ *   SIGNED, not as dates. The parallel `_d` fields exist for querying and are
+ *   never canonicalised. Storing these as BSON Dates and formatting them back
+ *   on read is how a whole chain silently shifts by a timezone offset and
+ *   every event reports ALTERED — unfixably, since correcting a value changes
+ *   its hash.
+ */
+export function toDoc(e) {
+  return {
+    _id: e.seq,
+    seq: e.seq,
+    event_id: e.event_id,
+    type: e.type,
+    subject_ref: e.subject_ref ?? null,
+    device_ref: e.device_ref ?? null,
+    session_ref: e.session_ref ?? null,
+    location_ref: e.location_ref ?? null,
+    payload: e.payload ?? {},
+    captured_at: e.captured_at ?? null,
+    received_at: e.received_at,
+    captured_at_d: e.captured_at ? new Date(e.captured_at) : null,
+    received_at_d: new Date(e.received_at),
+    device_time: e.device_time ?? null,
+    uptime_ms: e.uptime_ms ?? null,
+    canon_v: e.canon_v,
+    prev_hash: e.prev_hash,
+    hash: e.hash,
+    signature: e.signature,
+  };
+}
+
+/**
+ * A stored document → an event.
+ *
+ * `?? null` on every optional field, deliberately. A MISSING BSON key reads as
+ * `undefined`, and `Number(undefined)` is `NaN` — which envelopeOf's `?? undefined`
+ * does not catch and canonical.js then refuses, taking /chain/verify and
+ * /chain/export down with a 500 rather than reporting the one bad event.
+ */
+export function docToEvent(d) {
+  return {
+    seq: Number(d.seq),
+    event_id: d.event_id,
+    type: d.type,
+    subject_ref: d.subject_ref ?? null,
+    device_ref: d.device_ref ?? null,
+    session_ref: d.session_ref ?? null,
+    location_ref: d.location_ref ?? null,
+    payload: d.payload ?? {},
+    captured_at: d.captured_at ?? null,
+    received_at: d.received_at ?? null,
+    device_time: d.device_time ?? null,
+    uptime_ms: d.uptime_ms ?? null,
+    canon_v: Number(d.canon_v),
+    prev_hash: d.prev_hash,
+    hash: d.hash,
+    signature: d.signature,
+  };
+}
+
 /** Is this a type the chain is allowed to carry? BR-EVD-17. */
 export const isKnownType = (type) => EVENT_TYPES.includes(type);
 
 export async function chainHead() {
-  const pool = getPool();
-  const [rows] = await pool.execute('SELECT seq, hash, updated_at FROM chain_head WHERE id = 1');
-  const head = rows[0] ?? { seq: 0, hash: GENESIS_HASH };
+  const head = (await col('chain_head').findOne({ _id: HEAD_ID }))
+            ?? { seq: 0, hash: GENESIS_HASH, updated_at: null };
   return { seq: Number(head.seq), hash: head.hash, updated_at: head.updated_at ?? null };
 }
 
@@ -252,12 +412,13 @@ export async function readRange(fromSeq = 1, limit = 1000) {
   const from = Math.max(1, Math.floor(Number(fromSeq) || 1));
   const take = Math.min(Math.max(1, Math.floor(Number(limit) || 1000)), 50000);
 
-  const pool = getPool();
-  const [rows] = await pool.execute(
-    `SELECT * FROM events WHERE seq >= ? ORDER BY seq ASC LIMIT ${take}`,
-    [from],
-  );
-  return rows.map(rowToEvent);
+  // Sorting on seq is an index scan for free: _id IS seq.
+  const docs = await col('events')
+    .find({ seq: { $gte: from } })
+    .sort({ seq: 1 })
+    .limit(take)
+    .toArray();
+  return docs.map(docToEvent);
 }
 
 /**
@@ -268,14 +429,36 @@ export async function readRange(fromSeq = 1, limit = 1000) {
  * one was altered, a bad hash means its content was altered, and a bad
  * signature means it was never ours.
  */
-export async function verifyChain({ fromSeq = 1, limit = 100000 } = {}) {
-  const events = await readRange(fromSeq, limit);
+/**
+ * The verification itself, over events already in hand and sorted by seq.
+ *
+ * Separated from the read so it can be tested without a database and reused by
+ * any store. Nothing here touches SQL.
+ */
+export function verifyEvents(events, fromSeq = 1) {
   if (events.length === 0) return { ok: true, checked: 0, from: fromSeq, to: fromSeq - 1 };
 
   let expectedSeq = events[0].seq;
   let expectedPrev = expectedSeq === 1 ? GENESIS_HASH : null;
+  let lastSeq = null;
 
   for (const e of events) {
+    // ── DUPLICATE_SEQ ────────────────────────────────────────────────────
+    // Under MySQL this could not happen: PRIMARY KEY (seq) made it
+    // impossible, which is why there was no branch for it. Any store without
+    // that guarantee can produce two events at one position — a FORK, where
+    // both halves verify perfectly against themselves.
+    //
+    // It must be checked BEFORE the gap test, because a duplicate otherwise
+    // trips that branch and is reported as "a record is missing". Accusing
+    // yourself of deleting a record when what actually happened was a fork
+    // sends the investigation in exactly the wrong direction.
+    if (lastSeq !== null && e.seq === lastSeq) {
+      return fail(e, 'DUPLICATE_SEQ',
+        `two events occupy seq ${e.seq} — the chain has forked, no record is missing`);
+    }
+    lastSeq = e.seq;
+
     if (e.seq !== expectedSeq) {
       return fail(e, 'GAP', `expected seq ${expectedSeq}, found ${e.seq} — a record is missing`);
     }
@@ -303,6 +486,10 @@ export async function verifyChain({ fromSeq = 1, limit = 100000 } = {}) {
     to: events[events.length - 1].seq,
     head: events[events.length - 1].hash,
   };
+}
+
+export async function verifyChain({ fromSeq = 1, limit = 100000 } = {}) {
+  return verifyEvents(await readRange(fromSeq, limit), fromSeq);
 }
 
 const fail = (e, reason, detail) => ({

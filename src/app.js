@@ -14,7 +14,6 @@ import pino from 'pino';
 import authRoutes from './routes/auth.js';
 import employeeRoutes from './routes/employees.js';
 import eventRoutes from './routes/events.js';
-import enrolmentRoutes from './routes/enrolment.js';
 import faceEnrolmentRoutes from './routes/face-enrolment.js';
 import { unreviewedQuarantine } from './lib/chain.js';
 import { publishingPosture } from './lib/heads.js';
@@ -75,7 +74,6 @@ export function buildApp(options = {}) {
   authRoutes(app);
   employeeRoutes(app);
   eventRoutes(app);
-  enrolmentRoutes(app);
   faceEnrolmentRoutes(app);
 
   app.use((_req, res) => {

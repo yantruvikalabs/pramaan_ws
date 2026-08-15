@@ -10,7 +10,7 @@
  *   node src/db/bootstrap.js EMP-0001 "Name" 9876543210
  */
 
-import { query, closePool } from '../db.js';
+import { connect, col, closeClient } from './mongo.js';
 import { ROLE, EMPLOYEE_STATUS } from '@pramaan/shared';
 import { normalisePhone } from '../lib/import.js';
 import { looksLikeAadhaar } from '../lib/aadhaar.js';
@@ -34,22 +34,30 @@ if (looksLikeAadhaar(employeeId) || looksLikeAadhaar(name) || looksLikeAadhaar(p
   process.exit(1);
 }
 
-const existing = await query('SELECT COUNT(*) AS n FROM employees WHERE role = ?', [
-  ROLE.SUPER_ADMIN,
-]);
+await connect();
 
-if (existing[0].n > 0) {
+const existing = await col('employees').countDocuments({ role: ROLE.SUPER_ADMIN });
+
+if (existing > 0) {
   console.error('✗ a super admin already exists. Manage further roles in the app.');
-  await closePool();
+  await closeClient();
   process.exit(1);
 }
 
-await query(
-  `INSERT INTO employees (employee_id, name, phone, role, status, language)
-   VALUES (?,?,?,?,?,?)`,
-  [employeeId, name, phone, ROLE.SUPER_ADMIN, EMPLOYEE_STATUS.ENROLMENT_PENDING, 'hi'],
-);
+const now = new Date();
+await col('employees').insertOne({
+  _id: employeeId,
+  name,
+  phone,
+  email: null,
+  role: ROLE.SUPER_ADMIN,
+  reports_to: null,
+  status: EMPLOYEE_STATUS.ENROLMENT_PENDING,
+  language: 'hi',
+  created_at: now,
+  updated_at: now,
+});
 
 console.log(`✓ super admin created: ${employeeId} (${name})`);
 console.log('  Sign in with this employee ID and the OTP sent to that phone.');
-await closePool();
+await closeClient();

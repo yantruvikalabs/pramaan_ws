@@ -12,7 +12,8 @@
 
 import { createHash } from 'node:crypto';
 import { startTestServer } from './harness.mjs';
-import { query, closePool } from '../src/db.js';
+import { connect, col, closeClient } from '../src/db/mongo.js';
+import { applySchema, HEAD_ID, GENESIS_HASH } from '../src/db/mongo-schema.js';
 import { ROLE, EMPLOYEE_STATUS, EVENT_TYPE } from '@pramaan/shared';
 
 const results = [];
@@ -25,17 +26,17 @@ function check(criterion, description, passed, detail = '') {
 }
 
 async function reset() {
-  await query('SET FOREIGN_KEY_CHECKS = 0');
-  for (const t of ['events', 'quarantine', 'published_heads', 'location_fixes',
+  await connect();
+  await applySchema({ log: { log: () => {} } });
+  for (const c of ['events', 'quarantine', 'published_heads', 'location_fixes',
                    'subject_refs', 'sessions', 'otp_codes', 'employees']) {
-    await query(`TRUNCATE TABLE ${t}`); // pramaan-guard:allow — test harness reset
+    await col(c).deleteMany({}); // pramaan-guard:allow — test harness reset
   }
-  await query(
-    `UPDATE chain_head SET seq = 0,
-       hash = 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
-     WHERE id = 1`,
+  await col('chain_head').updateOne(
+    { _id: HEAD_ID },
+    { $set: { seq: 0, hash: GENESIS_HASH, updated_at: new Date() } },
+    { upsert: true },
   );
-  await query('SET FOREIGN_KEY_CHECKS = 1');
 }
 
 async function signIn(identifier, channel = 'MOBILE') {
@@ -65,18 +66,18 @@ console.log('\n\x1b[1mGATE 2 — Evidence spine\x1b[0m\n');
 app = await startTestServer();
 await reset();
 
-await query(
-  `INSERT INTO employees (employee_id, name, phone, email, role, status)
-   VALUES (?,?,?,?,?,?)`,
-  ['ADM-0001', 'Bootstrap Admin', '9800000001', 'admin@demo.example',
-   ROLE.SUPER_ADMIN, EMPLOYEE_STATUS.ENROLMENT_PENDING],
-);
-await query(
-  `INSERT INTO employees (employee_id, name, phone, role, reports_to, status)
-   VALUES (?,?,?,?,?,?)`,
-  ['EMP-0001', 'Ramesh Kumar', '9800000002', ROLE.EMPLOYEE, 'ADM-0001',
-   EMPLOYEE_STATUS.ENROLMENT_PENDING],
-);
+await col('employees').insertOne({
+  _id: 'ADM-0001', name: 'Bootstrap Admin', phone: '9800000001',
+  email: 'admin@demo.example', role: ROLE.SUPER_ADMIN, reports_to: null,
+  status: EMPLOYEE_STATUS.ENROLMENT_PENDING, language: 'hi',
+  created_at: new Date(), updated_at: new Date(),
+});
+await col('employees').insertOne({
+  _id: 'EMP-0001', name: 'Ramesh Kumar', phone: '9800000002', email: null,
+  role: ROLE.EMPLOYEE, reports_to: 'ADM-0001',
+  status: EMPLOYEE_STATUS.ENROLMENT_PENDING, language: 'hi',
+  created_at: new Date(), updated_at: new Date(),
+});
 
 const admin = await signIn('ADM-0001', 'WEB');
 const worker = await signIn('9800000002');
@@ -111,10 +112,10 @@ for (let b = 0; b < 5; b++) {
 
 check(1, '500 events accepted', uploaded === 500, `${uploaded} appended`);
 
-const [{ n: stored }] = await query('SELECT COUNT(*) AS n FROM events');
+const stored = await col('events').countDocuments({});
 check(1, 'all 500 are in the chain', stored === 500, `${stored} rows`);
 
-const ordered = await query('SELECT seq FROM events ORDER BY seq');
+const ordered = await col('events').find({}, { projection: { seq: 1 } }).sort({ seq: 1 }).toArray();
 const gapless = ordered.every((r, i) => Number(r.seq) === i + 1);
 check(1, 'sequence numbers are gapless from 1', gapless,
   `1 … ${ordered.length}, no gaps`);
@@ -132,16 +133,14 @@ check(3, 'every re-sent event is acknowledged as a duplicate',
   rb.duplicates === BATCH && rb.accepted === 0,
   `accepted ${rb.accepted}, duplicates ${rb.duplicates}`);
 
-const [{ n: afterReplay }] = await query('SELECT COUNT(*) AS n FROM events');
+const afterReplay = await col('events').countDocuments({});
 check(3, 'no duplicate rows were created', afterReplay === 500, `${afterReplay} rows`);
 
 // ── Criterion 5: the drain-only path ─────────────────────────────────────
 console.log('\n\x1b[1m5. A replaced phone can still deliver, and do nothing else\x1b[0m');
 
 const replacement = await signIn('9800000002');   // displaces `worker`
-const [displaced] = await query(
-  'SELECT state FROM sessions WHERE session_id = ?', [worker.session_id],
-);
+const displaced = await col('sessions').findOne({ _id: worker.session_id });
 check(5, 'the old phone became DRAIN_ONLY, not revoked',
   displaced?.state === 'DRAIN_ONLY', `state ${displaced?.state}`);
 
@@ -171,7 +170,7 @@ check(4, 'the chain verifies before anything is touched', before.json().ok === t
 // Deliberately tampering, to prove it is detected. The two lines below are
 // the ONLY writes to `events` anywhere in this repository, and they exist to
 // make the append-only rule demonstrable rather than merely asserted.
-await query(`UPDATE events SET payload = JSON_SET(payload, '$.punch_index', 9999) WHERE seq = 250`); // pramaan-guard:allow
+await col('events').updateOne({ _id: 250 }, { $set: { 'payload.punch_index': 9999 } }); // pramaan-guard:allow — proving detection
 const altered = await get('/chain/verify', admin.token);
 const a = altered.json();
 check(4, 'an altered record is found, and named', a.ok === false && a.at_seq === 250,
@@ -179,7 +178,7 @@ check(4, 'an altered record is found, and named', a.ok === false && a.at_seq ===
 
 // Put it back exactly, showing the check is on content and not a one-way
 // "tampered" flag that could simply be reset.
-await query(`UPDATE events SET payload = JSON_SET(payload, '$.punch_index', 250) WHERE seq = 250`); // pramaan-guard:allow
+await col('events').updateOne({ _id: 250 }, { $set: { 'payload.punch_index': 250 } }); // pramaan-guard:allow — restoring it
 const restored = await get('/chain/verify', admin.token);
 check(4, 'restoring the exact value makes it valid again — the check is on content',
   restored.json().ok === true, `${restored.json().checked} events`);
@@ -198,7 +197,7 @@ check(6, 'the head was written OUTSIDE the database',
   headBefore.sinks?.file === true,
   `sinks ${JSON.stringify(headBefore.sinks)}`);
 
-await query('DELETE FROM events WHERE seq = 300'); // pramaan-guard:allow — proving detection
+await col('events').deleteOne({ _id: 300 }); // pramaan-guard:allow — proving detection
 const afterDelete = await get('/chain/verify', admin.token);
 const d = afterDelete.json();
 check(6, 'a deleted record leaves a detectable gap',
@@ -249,7 +248,7 @@ check(8, 'an unknown event type is quarantined, not accepted',
   bogus.json().quarantined === 1 && bogus.json().accepted === 0,
   JSON.stringify(bogus.json().results[0]));
 
-const [{ n: held }] = await query('SELECT COUNT(*) AS n FROM quarantine');
+const held = await col('quarantine').countDocuments({});
 check(8, 'the submission is retained for somebody to look at', held >= 1, `${held} held`);
 
 const health = await app.inject({ method: 'GET', url: '/health' });
@@ -268,10 +267,8 @@ check(9, 'adding an employee writes a signed event',
   made.statusCode === 201 && made.json().event?.seq > 0,
   `seq ${made.json().event?.seq}`);
 
-const [imported] = await query(
-  `SELECT payload FROM events WHERE type = ? ORDER BY seq DESC LIMIT 1`,
-  [EVENT_TYPE.EMPLOYEES_IMPORTED],
-);
+const imported = await col('events')
+  .find({ type: EVENT_TYPE.EMPLOYEES_IMPORTED }).sort({ seq: -1 }).limit(1).next();
 const p = typeof imported?.payload === 'string' ? JSON.parse(imported.payload) : imported?.payload;
 check(9, 'it records who did it and their role at that moment — BR-EVD-9',
   p?.actor_role === ROLE.SUPER_ADMIN && Boolean(p?.actor_ref),
@@ -297,7 +294,7 @@ if (failed === 0) {
 console.log(`${'─'.repeat(64)}\n`);
 
 await app.close();
-await closePool();
+await closeClient();
 process.exit(failed === 0 ? 0 : 1);
 
 /* ── An independent canonicaliser ────────────────────────────────────────

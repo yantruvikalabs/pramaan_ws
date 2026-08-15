@@ -1,3 +1,16 @@
+/**
+ * ⚠ LEGACY — MySQL. Not used by the running application.
+ *
+ * Every live path moved to MongoDB in D3 (docs/mongodb-migration-plan.md §P).
+ * This file survives for exactly one reason: `tools/migrate-to-mongo.mjs` reads
+ * the old database through it, and that tool is the only way to move a MySQL
+ * chain across.
+ *
+ * Do not import this from `src/`. When the MySQL data is confirmed no longer
+ * needed, delete this file, `src/db/migrate.js`, `src/db/schema.sql`,
+ * `tools/migrate-to-mongo.mjs` and the `mysql2` dependency together.
+ */
+
 import mysql from 'mysql2/promise';
 import { config } from './config.js';
 

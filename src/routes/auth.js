@@ -26,8 +26,10 @@ import {
 } from '../lib/sessions.js';
 import { requireAuth, signToken } from '../middleware/auth.js';
 import { otpRequestLimiter, otpVerifyLimiter } from '../middleware/rate-limit.js';
-import { query } from '../db.js';
+import { col } from '../db/mongo.js';
+import { toEmployee } from '../lib/employee-store.js';
 import { config } from '../config.js';
+import { isPast } from '../lib/time.js';
 
 const identifier = z.string().trim().min(1).max(255);
 
@@ -52,12 +54,10 @@ async function resolveEmployee(raw) {
   if (!id) return null;
 
   const { column, value, channel } = lookupFor(id);
-  const rows = await query(
-    `SELECT employee_id, name, phone, email, role, status, language
-       FROM employees WHERE ${column} = ?`,
-    [value],
-  );
-  const employee = rows[0];
+  // lookupFor still speaks in MySQL column names because it is also the
+  // vocabulary the identity rules are written in. `employee_id` IS `_id` here.
+  const field = column === 'employee_id' ? '_id' : column;
+  const employee = toEmployee(await col('employees').findOne({ [field]: value }));
   if (!employee) return null;
 
   // Asked for by email but no email on file cannot happen — the lookup was
@@ -117,14 +117,19 @@ export default function authRoutes(app) {
     const expiresAt = new Date(Date.now() + config.otp.ttlMinutes * 60_000);
 
     // Any earlier unconsumed code is retired, so only the newest one works.
-    await query(
-      'UPDATE otp_codes SET consumed_at = NOW(3) WHERE employee_id = ? AND consumed_at IS NULL',
-      [employee.employee_id],
+    await col('otp_codes').updateMany(
+      { employee_id: employee.employee_id, consumed_at: null },
+      { $set: { consumed_at: new Date() } },
     );
-    await query(
-      'INSERT INTO otp_codes (employee_id, code_hash, channel, expires_at) VALUES (?,?,?,?)',
-      [employee.employee_id, hash(code, employee.employee_id), channel, expiresAt],
-    );
+    await col('otp_codes').insertOne({
+      employee_id: employee.employee_id,
+      code_hash: hash(code, employee.employee_id),
+      channel,
+      expires_at: expiresAt,
+      attempts: 0,
+      consumed_at: null,
+      created_at: new Date(),
+    });
 
     const destination = maskDestination(channel, employee.phone, employee.email);
     const { devCode } = await sendCode({
@@ -166,36 +171,40 @@ export default function authRoutes(app) {
     if (!resolved || resolved.employee.status === 'INACTIVE') return invalid();
     const { employee } = resolved;
 
-    const rows = await query(
-      `SELECT id, code_hash, attempts, expires_at
-         FROM otp_codes
-        WHERE employee_id = ? AND consumed_at IS NULL
-        ORDER BY id DESC LIMIT 1`,
-      [employee.employee_id],
-    );
-    const otp = rows[0];
+    // Sorted on created_at, NOT on _id.
+    //
+    // The MySQL version used `ORDER BY id DESC` and relied on AUTO_INCREMENT.
+    // An ObjectId is only second-granular with a per-process counter, so two
+    // codes issued inside the same second by two API processes can order
+    // backwards — and the user's NEWEST code would be rejected while a retired
+    // one was compared. _id is kept as a tiebreak within the same millisecond.
+    const otp = await col('otp_codes')
+      .find({ employee_id: employee.employee_id, consumed_at: null })
+      .sort({ created_at: -1, _id: -1 })
+      .limit(1)
+      .next();
     if (!otp) return invalid();
 
     if (otp.attempts >= config.otp.maxAttempts) {
-      await query('UPDATE otp_codes SET consumed_at = NOW(3) WHERE id = ?', [otp.id]);
+      await col('otp_codes').updateOne({ _id: otp._id }, { $set: { consumed_at: new Date() } });
       return res.status(429).json({
         error: 'TOO_MANY_ATTEMPTS',
         message: 'Too many wrong attempts. Ask for a new code.',
       });
     }
 
-    if (new Date(`${otp.expires_at}Z`).getTime() < Date.now()) return invalid();
+    if (isPast(otp.expires_at, 'otp.expires_at')) return invalid();
 
     const expected = Buffer.from(otp.code_hash, 'hex');
     const actual = Buffer.from(hash(code, employee.employee_id), 'hex');
     const ok = expected.length === actual.length && timingSafeEqual(expected, actual);
 
     if (!ok) {
-      await query('UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?', [otp.id]);
+      await col('otp_codes').updateOne({ _id: otp._id }, { $inc: { attempts: 1 } });
       return invalid();
     }
 
-    await query('UPDATE otp_codes SET consumed_at = NOW(3) WHERE id = ?', [otp.id]);
+    await col('otp_codes').updateOne({ _id: otp._id }, { $set: { consumed_at: new Date() } });
 
     // FRD BR-WEB-1. Checked here rather than at every web endpoint so a
     // senior is told plainly at the door, not after a confusing half-login.

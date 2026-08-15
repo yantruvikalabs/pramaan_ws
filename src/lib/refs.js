@@ -16,7 +16,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { query } from '../db.js';
+import { col } from '../db/mongo.js';
 
 const opaque = (prefix) => `${prefix}-${randomUUID().replace(/-/g, '')}`;
 
@@ -29,45 +29,44 @@ const opaque = (prefix) => `${prefix}-${randomUUID().replace(/-/g, '')}`;
  * is "meaningless without the mapping", not "meaningless to everybody".
  */
 export async function subjectRefFor(employeeId) {
-  const rows = await query(
-    'SELECT subject_ref FROM subject_refs WHERE employee_id = ?',
-    [employeeId],
-  );
-  if (rows[0]) return rows[0].subject_ref;
+  const existing = await col('subject_refs').findOne({ employee_id: employeeId });
+  if (existing) return existing._id;
 
   const ref = opaque('SUB');
-  // A concurrent first-punch from two devices would otherwise create two.
-  await query(
-    'INSERT INTO subject_refs (subject_ref, employee_id) VALUES (?,?) ' +
-    'ON DUPLICATE KEY UPDATE subject_ref = subject_ref',
-    [ref, employeeId],
-  );
-  const [row] = await query(
-    'SELECT subject_ref FROM subject_refs WHERE employee_id = ?',
-    [employeeId],
-  );
-  return row.subject_ref;
+  try {
+    // $setOnInsert, never $set: if a concurrent call created the mapping
+    // first, this must leave it alone. Overwriting would hand the same person
+    // a second reference and split their history across two identities.
+    await col('subject_refs').updateOne(
+      { employee_id: employeeId },
+      { $setOnInsert: { _id: ref, employee_id: employeeId, created_at: new Date() } },
+      { upsert: true },
+    );
+  } catch (err) {
+    // An upsert on a unique index is NOT race-free: two concurrent first
+    // punches from two devices can both miss the find and both attempt the
+    // insert, and one gets E11000. MySQL's ON DUPLICATE KEY UPDATE absorbed
+    // this silently. Here the loser must re-read rather than throw — an
+    // exception would fail the whole ingest batch for a punch that is fine.
+    if (err?.code !== 11000) throw err;
+  }
+
+  const row = await col('subject_refs').findOne({ employee_id: employeeId });
+  return row._id;
 }
 
 /** Who a reference belongs to, or null once erased. */
 export async function employeeForSubject(subjectRef) {
-  const rows = await query(
-    'SELECT employee_id FROM subject_refs WHERE subject_ref = ?',
-    [subjectRef],
-  );
-  return rows[0]?.employee_id ?? null;
+  const row = await col('subject_refs').findOne({ _id: subjectRef });
+  return row?.employee_id ?? null;
 }
 
 /** Resolve many at once — a report joins hundreds of these. */
 export async function employeesForSubjects(refs) {
   const unique = [...new Set(refs.filter(Boolean))];
   if (unique.length === 0) return new Map();
-  const rows = await query(
-    `SELECT subject_ref, employee_id FROM subject_refs
-      WHERE subject_ref IN (${unique.map(() => '?').join(',')})`,
-    unique,
-  );
-  return new Map(rows.map((r) => [r.subject_ref, r.employee_id]));
+  const rows = await col('subject_refs').find({ _id: { $in: unique } }).toArray();
+  return new Map(rows.map((r) => [r._id, r.employee_id]));
 }
 
 /**
@@ -81,28 +80,49 @@ export async function locationRefFor(fix) {
   if (!fix || fix.lat === undefined || fix.lon === undefined) return null;
 
   const ref = opaque('LOC');
-  await query(
-    `INSERT INTO location_fixes (location_ref, lat, lon, accuracy_m, is_mock)
-     VALUES (?,?,?,?,?)`,
-    [ref, fix.lat, fix.lon, fix.accuracy_m ?? null, fix.is_mock ? 1 : 0],
-  );
+  await col('location_fixes').insertOne({
+    _id: ref,
+    lat: Number(fix.lat),
+    lon: Number(fix.lon),
+    accuracy_m: fix.accuracy_m === undefined || fix.accuracy_m === null ? null : Number(fix.accuracy_m),
+    // A real boolean now, not TINYINT(1)'s 1/0. The schema validator enforces
+    // the type, and toLocation() reads it with Boolean() rather than `=== 1`.
+    is_mock: Boolean(fix.is_mock),
+    created_at: new Date(),
+  });
   return ref;
 }
 
-export async function locationFor(locationRef) {
-  if (!locationRef) return null;
-  const rows = await query(
-    'SELECT lat, lon, accuracy_m, is_mock FROM location_fixes WHERE location_ref = ?',
-    [locationRef],
-  );
-  const r = rows[0];
+/**
+ * A stored location row → the shape the rest of the product uses.
+ *
+ * Exported and pure so it can be tested without a database, because the one
+ * line in it that matters cannot be tested any other way.
+ *
+ * ⚠ `Boolean(r.is_mock)`, never `r.is_mock === 1`.
+ *
+ * MySQL's TINYINT(1) returns the NUMBER 1. A BSON boolean returns `true`, and
+ * `true === 1` is **false** — so the same spoofed fix that reads as mocked
+ * today would read as genuine after the store changes, silently, with no
+ * error anywhere. FRD §14.6 makes mock-location detection the control against
+ * fake GPS, so this single comparison is the whole control.
+ *
+ * The coordinates go through Number() for the same reason: MySQL's DECIMAL(9,6)
+ * arrives as a string, a BSON Double as a number, and both must end up as one.
+ */
+export function toLocation(r) {
   if (!r) return null;
   return {
     lat: Number(r.lat),
     lon: Number(r.lon),
-    accuracy_m: r.accuracy_m === null ? null : Number(r.accuracy_m),
-    is_mock: r.is_mock === 1,
+    accuracy_m: r.accuracy_m === null || r.accuracy_m === undefined ? null : Number(r.accuracy_m),
+    is_mock: Boolean(r.is_mock),
   };
+}
+
+export async function locationFor(locationRef) {
+  if (!locationRef) return null;
+  return toLocation(await col('location_fixes').findOne({ _id: locationRef }));
 }
 
 /**
@@ -118,29 +138,43 @@ export async function locationFor(locationRef) {
  * called by an operator, from a script, on a decision already taken.
  */
 export async function eraseSubject(employeeId) {
-  const rows = await query(
-    'SELECT subject_ref FROM subject_refs WHERE employee_id = ?',
-    [employeeId],
-  );
-  if (rows.length === 0) return { erased: false, reason: 'NO_MAPPING' };
+  const mapping = await col('subject_refs').findOne({ employee_id: employeeId });
+  if (!mapping) return { erased: false, reason: 'NO_MAPPING' };
 
-  const subjectRef = rows[0].subject_ref;
+  const subjectRef = mapping._id;
 
-  // Coordinates first: they identify a person on their own, so a partial
-  // erasure that removed the name and left the trail would be no erasure.
-  const [{ n: fixes }] = await query(
-    `SELECT COUNT(*) AS n FROM location_fixes
-      WHERE location_ref IN (SELECT location_ref FROM events
-                              WHERE subject_ref = ? AND location_ref IS NOT NULL)`,
-    [subjectRef],
-  );
-  await query(
-    `DELETE FROM location_fixes
-      WHERE location_ref IN (SELECT location_ref FROM events
-                              WHERE subject_ref = ? AND location_ref IS NOT NULL)`,
-    [subjectRef],
-  );
-  await query('DELETE FROM subject_refs WHERE employee_id = ?', [employeeId]);
+  // MySQL did this as one correlated subquery. Here it is two round trips,
+  // which introduces a partial-failure window: removing the name mapping while
+  // leaving the coordinate trail is NOT an erasure — a day's positions
+  // identify a person with no name attached.
+  //
+  // So coordinates go FIRST, and the result is verified by reading back rather
+  // than trusted. If any fix survives, the mapping is deliberately left in
+  // place: a caller that is told "erased" must be able to rely on it, and a
+  // half-erasure that reports success is worse than one that reports failure.
+  const refs = await col('events').distinct('location_ref',
+    { subject_ref: subjectRef, location_ref: { $ne: null } });
 
-  return { erased: true, subject_ref: subjectRef, location_fixes_removed: Number(fixes) };
+  const expected = refs.length === 0
+    ? 0
+    : await col('location_fixes').countDocuments({ _id: { $in: refs } });
+
+  if (refs.length > 0) await col('location_fixes').deleteMany({ _id: { $in: refs } });
+
+  const remaining = refs.length === 0
+    ? 0
+    : await col('location_fixes').countDocuments({ _id: { $in: refs } });
+
+  if (remaining > 0) {
+    return {
+      erased: false,
+      reason: 'LOCATION_FIXES_REMAIN',
+      subject_ref: subjectRef,
+      location_fixes_remaining: remaining,
+    };
+  }
+
+  await col('subject_refs').deleteOne({ employee_id: employeeId });
+
+  return { erased: true, subject_ref: subjectRef, location_fixes_removed: expected };
 }

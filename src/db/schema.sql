@@ -1,3 +1,12 @@
+-- ⚠ SUPERSEDED. The application runs on MongoDB — see src/db/mongo-schema.js.
+--
+-- Kept deliberately, for two reasons:
+--   1. tools/migrate-to-mongo.mjs reads a database built by this file.
+--   2. The comments below record WHY each constraint exists, and every one of
+--      those reasons still applies. mongo-schema.js says which of them are now
+--      enforced by the application rather than by the database — read the two
+--      together, not this one alone.
+--
 -- Pramaan — Phase 1 schema.
 --
 -- Master data (mutable) plus the Phase 2 evidence chain (append-only).

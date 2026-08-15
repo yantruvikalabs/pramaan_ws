@@ -16,7 +16,8 @@ import {
 } from '../lib/import.js';
 import { descendantsOf } from '../lib/tree.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
-import { query, transaction } from '../db.js';
+import { col, getClient, CHAIN_TXN_OPTIONS } from '../db/mongo.js';
+import { toEmployee } from '../lib/employee-store.js';
 
 const CHUNK = 500;
 
@@ -61,11 +62,13 @@ async function recordImport({ batchId, actor, fileSha, source, fileName, totals 
  * error, which tells an admin nothing they can act on.
  */
 async function existingIdentifiers() {
-  const rows = await query('SELECT employee_id, phone, email FROM employees');
+  const rows = await col('employees')
+    .find({}, { projection: { phone: 1, email: 1 } })
+    .toArray();
   return {
-    ids: new Set(rows.map((r) => r.employee_id)),
-    phones: new Map(rows.map((r) => [r.phone, r.employee_id])),
-    emails: new Map(rows.filter((r) => r.email).map((r) => [r.email, r.employee_id])),
+    ids: new Set(rows.map((r) => r._id)),
+    phones: new Map(rows.map((r) => [r.phone, r._id])),
+    emails: new Map(rows.filter((r) => r.email).map((r) => [r.email, r._id])),
   };
 }
 
@@ -127,32 +130,41 @@ export default function employeeRoutes(app) {
     const e = check.employee;
     const batchId = randomUUID();
 
-    await transaction(async (conn) => {
-      await conn.execute(
-        `INSERT INTO employees
-           (employee_id, name, phone, email, role, reports_to, language, status)
-         VALUES (?,?,?,?,?,?,?,?)`,
-        [e.employee_id, e.name, e.phone, e.email, e.role, e.reports_to, e.language, e.status],
-      );
+    const session = getClient().startSession();
+    try {
+      await session.withTransaction(async () => {
+        const now = new Date();
+        await col('employees').insertOne({
+          _id: e.employee_id,
+          name: e.name,
+          phone: e.phone,
+          email: e.email,
+          role: e.role,
+          reports_to: e.reports_to,
+          language: e.language,
+          status: e.status,
+          created_at: now,
+          updated_at: now,
+        }, { session });
 
-      // The index row. The RECORD is the chain event written below —
-      // BR-MST-6. This table stays because a report wants to page through
-      // batches without walking the chain, but it is not the evidence.
-      await conn.execute(
-        `INSERT INTO import_batches
-           (batch_id, imported_by, file_name, file_sha256,
-            total_rows, accepted, rejected, report)
-         VALUES (?,?,?,?,?,?,?,?)`,
-        [
-          batchId,
-          req.employee.employee_id,
-          null,
-          createHash('sha256').update(JSON.stringify(e)).digest('hex'),
-          1, 1, 0,
-          JSON.stringify({ created: 1, updated: 0, source: 'MANUAL', rejected: [], warnings: [] }),
-        ],
-      );
-    });
+        // The index row. The RECORD is the chain event written below —
+        // BR-MST-6. This collection stays because a report wants to page
+        // through batches without walking the chain, but it is not the evidence.
+        await col('import_batches').insertOne({
+          _id: batchId,
+          imported_by: req.employee.employee_id,
+          file_name: null,
+          file_sha256: createHash('sha256').update(JSON.stringify(e)).digest('hex'),
+          total_rows: 1,
+          accepted: 1,
+          rejected: 0,
+          report: { created: 1, updated: 0, source: 'MANUAL', rejected: [], warnings: [] },
+          created_at: now,
+        }, { session });
+      }, CHAIN_TXN_OPTIONS);
+    } finally {
+      await session.endSession();
+    }
 
     // Into the chain, after the transaction commits. A person added to the
     // master with no event would be a person who appears in the attendance
@@ -165,11 +177,7 @@ export default function employeeRoutes(app) {
       totals: { total: 1, created: 1, updated: 0, rejected: 0 },
     });
 
-    const [created] = await query(
-      `SELECT employee_id, name, phone, email, role, reports_to, status, language
-         FROM employees WHERE employee_id = ?`,
-      [e.employee_id],
-    );
+    const created = toEmployee(await col('employees').findOne({ _id: e.employee_id }));
 
     return res.status(201).json({ employee: created, batch_id: batchId, event: chained });
   });
@@ -217,65 +225,77 @@ export default function employeeRoutes(app) {
       const batchId = randomUUID();
 
       if (result.accepted.length > 0) {
-        await transaction(async (conn) => {
-          // Pass 1: write everyone with reports_to NULL. The self-referencing
-          // foreign key means a row cannot name a senior who is not in the
-          // table yet — and a senior may appear further down the same file.
-          for (let i = 0; i < result.accepted.length; i += CHUNK) {
-            const chunk = result.accepted.slice(i, i + CHUNK);
-            const placeholders = chunk.map(() => '(?,?,?,?,?,?,?)').join(',');
-            const values = chunk.flatMap((r) => [
-              r.employee_id, r.name, r.phone, r.email, r.role, r.language, r.status,
-            ]);
-            await conn.execute(
-              `INSERT INTO employees
-                 (employee_id, name, phone, email, role, language, status)
-               VALUES ${placeholders}
-               ON DUPLICATE KEY UPDATE
-                 name = VALUES(name),
-                 phone = VALUES(phone),
-                 email = VALUES(email),
-                 role = VALUES(role),
-                 language = VALUES(language)`,
-              // status is deliberately absent: re-importing must never
-              // disturb an existing employee's enrolment. FRD BR-MST-2.
-              values,
-            );
-          }
+        const session = getClient().startSession();
+        try {
+          await session.withTransaction(async () => {
+            // ⚠ $set of NAMED FIELDS, with status in $setOnInsert. Never a
+            //   whole-document replace, and never $set on status.
+            //
+            //   The MySQL statement listed exactly five columns in ON DUPLICATE
+            //   KEY UPDATE and omitted `status` on purpose (FRD BR-MST-2):
+            //   re-importing the payroll file must never disturb an existing
+            //   employee's enrolment. A replaceOne/upsert — the obvious port —
+            //   resets status to its default, turning every ENROLLED worker
+            //   back into ENROLMENT_PENDING and refusing them at the gate at
+            //   dawn, with no error anywhere.
+            //
+            //   reports_to is set only when the file names one, matching the
+            //   old two-pass behaviour where a null in the CSV left an existing
+            //   reporting line alone. The two passes themselves are gone: they
+            //   existed to satisfy a self-referencing foreign key that a row
+            //   could not violate before its senior was inserted, and there is
+            //   no such constraint now.
+            const now = new Date();
+            const ops = result.accepted.map((r) => {
+              const set = {
+                name: r.name,
+                phone: r.phone,
+                email: r.email,
+                role: r.role,
+                language: r.language,
+                updated_at: now,
+              };
+              const setOnInsert = { status: r.status, created_at: now };
 
-          // Pass 2: now that every id exists, attach the reporting lines.
-          const withSenior = result.accepted.filter((r) => r.reports_to !== null);
-          for (const row of withSenior) {
-            await conn.execute(
-              'UPDATE employees SET reports_to = ? WHERE employee_id = ?',
-              [row.reports_to, row.employee_id],
-            );
-          }
+              // A field may not appear in both operators.
+              if (r.reports_to !== null) set.reports_to = r.reports_to;
+              else setOnInsert.reports_to = null;
 
-          // BR-MST-6 requires this to be a signed event. Phase 2 turns it
-          // into EmployeesImported in the chain; the fields are already here.
-          await conn.execute(
-            `INSERT INTO import_batches
-               (batch_id, imported_by, file_name, file_sha256,
-                total_rows, accepted, rejected, report)
-             VALUES (?,?,?,?,?,?,?,?)`,
-            [
-              batchId,
-              req.employee.employee_id,
-              req.headers['x-file-name'] ?? null,
-              fileSha,
-              parsed.records.length,
-              result.accepted.length,
-              result.rejected.length,
-              JSON.stringify({
+              return {
+                updateOne: {
+                  filter: { _id: r.employee_id },
+                  update: { $set: set, $setOnInsert: setOnInsert },
+                  upsert: true,
+                },
+              };
+            });
+
+            for (let i = 0; i < ops.length; i += CHUNK) {
+              await col('employees').bulkWrite(ops.slice(i, i + CHUNK), { ordered: true, session });
+            }
+
+            // BR-MST-6 requires this to be a signed event. Phase 2 turns it
+            // into EmployeesImported in the chain; the fields are already here.
+            await col('import_batches').insertOne({
+              _id: batchId,
+              imported_by: req.employee.employee_id,
+              file_name: req.headers['x-file-name'] ?? null,
+              file_sha256: fileSha,
+              total_rows: parsed.records.length,
+              accepted: result.accepted.length,
+              rejected: result.rejected.length,
+              report: {
                 created: created.length,
                 updated: updated.length,
                 rejected: result.rejected,
                 warnings: result.warnings,
-              }),
-            ],
-          );
-        });
+              },
+              created_at: now,
+            }, { session });
+          }, CHAIN_TXN_OPTIONS);
+        } finally {
+          await session.endSession();
+        }
       }
 
       const chained = result.accepted.length > 0
@@ -319,10 +339,7 @@ export default function employeeRoutes(app) {
   app.get('/employees', requireAuth, async (req, res) => {
     const { role, employee_id: me } = req.employee;
 
-    const all = await query(
-      `SELECT employee_id, name, phone, email, role, reports_to, status, language
-         FROM employees ORDER BY employee_id`,
-    );
+    const all = (await col('employees').find({}).sort({ _id: 1 }).toArray()).map(toEmployee);
 
     if (role === ROLE.ADMIN || role === ROLE.SUPER_ADMIN) {
       return res.json({ employees: all, scope: 'ALL' });
@@ -341,19 +358,14 @@ export default function employeeRoutes(app) {
     const { role, employee_id: me } = req.employee;
     const targetId = req.params.id;
 
-    const rows = await query(
-      `SELECT employee_id, name, phone, email, role, reports_to, status, language
-         FROM employees WHERE employee_id = ?`,
-      [targetId],
-    );
-    const target = rows[0];
+    const target = toEmployee(await col('employees').findOne({ _id: targetId }));
     if (!target) {
       return res.status(404).json({ error: 'NOT_FOUND', message: 'No such employee.' });
     }
 
     if (role !== ROLE.ADMIN && role !== ROLE.SUPER_ADMIN && targetId !== me) {
-      const all = await query('SELECT employee_id, reports_to FROM employees');
-      const edges = new Map(all.map((e) => [e.employee_id, e.reports_to]));
+      const all = await col('employees').find({}, { projection: { reports_to: 1 } }).toArray();
+      const edges = new Map(all.map((e) => [e._id, e.reports_to]));
       if (!descendantsOf(me, edges).includes(targetId)) {
         return res.status(403).json({
           error: 'FORBIDDEN',
@@ -371,11 +383,11 @@ export default function employeeRoutes(app) {
     requireAuth,
     requireRole(ROLE.ADMIN),
     async (_req, res) => res.json({
-      batches: await query(
-        `SELECT batch_id, imported_by, file_name, file_sha256,
-                total_rows, accepted, rejected, created_at
-           FROM import_batches ORDER BY created_at DESC LIMIT 50`,
-      ),
+      batches: (await col('import_batches')
+        .find({}, { projection: { report: 0 } })
+        .sort({ created_at: -1 })
+        .limit(50)
+        .toArray()).map(({ _id, ...b }) => ({ batch_id: _id, ...b })),
     }),
   );
 
@@ -385,16 +397,24 @@ export default function employeeRoutes(app) {
     requireAuth,
     requireRole(ROLE.ADMIN),
     async (_req, res) => {
-      const [counts] = await query(
-        `SELECT COUNT(*) AS total,
-                SUM(status = ?) AS enrolment_pending,
-                SUM(status = ?) AS enrolled,
-                SUM(status = ?) AS inactive,
-                SUM(reports_to IS NULL) AS no_senior
-           FROM employees`,
-        [EMPLOYEE_STATUS.ENROLMENT_PENDING, EMPLOYEE_STATUS.ENROLLED, EMPLOYEE_STATUS.INACTIVE],
-      );
-      return res.json({ counts });
+      const [counts] = await col('employees').aggregate([
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            enrolment_pending: { $sum: { $cond: [{ $eq: ['$status', EMPLOYEE_STATUS.ENROLMENT_PENDING] }, 1, 0] } },
+            enrolled: { $sum: { $cond: [{ $eq: ['$status', EMPLOYEE_STATUS.ENROLLED] }, 1, 0] } },
+            inactive: { $sum: { $cond: [{ $eq: ['$status', EMPLOYEE_STATUS.INACTIVE] }, 1, 0] } },
+            no_senior: { $sum: { $cond: [{ $eq: [{ $ifNull: ['$reports_to', null] }, null] }, 1, 0] } },
+          },
+        },
+        { $project: { _id: 0 } },
+      ]).toArray();
+      return res.json({
+        counts: counts ?? {
+          total: 0, enrolment_pending: 0, enrolled: 0, inactive: 0, no_senior: 0,
+        },
+      });
     },
   );
 }

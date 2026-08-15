@@ -12,7 +12,8 @@
 
 import { readFile } from 'node:fs/promises';
 import { startTestServer } from './harness.mjs';
-import { query, closePool } from '../src/db.js';
+import { connect, col, closeClient } from '../src/db/mongo.js';
+import { applySchema } from '../src/db/mongo-schema.js';
 import { ROLE, EMPLOYEE_STATUS } from '@pramaan/shared';
 
 const results = [];
@@ -26,12 +27,12 @@ function check(criterion, description, passed, detail = '') {
 }
 
 async function reset() {
-  await query('SET FOREIGN_KEY_CHECKS = 0');
-  await query('TRUNCATE TABLE sessions');
-  await query('TRUNCATE TABLE otp_codes');
-  await query('TRUNCATE TABLE import_batches');
-  await query('TRUNCATE TABLE employees');
-  await query('SET FOREIGN_KEY_CHECKS = 1');
+  // No FOREIGN_KEY_CHECKS dance: there are no foreign keys to disable.
+  await connect();
+  await applySchema({ log: { log: () => {} } });
+  for (const c of ['sessions', 'otp_codes', 'import_batches', 'employees']) {
+    await col(c).deleteMany({});
+  }
 }
 
 /**
@@ -86,12 +87,12 @@ app = await startTestServer();
 await reset();
 
 // The first super admin is a deployment step, not an API call.
-await query(
-  `INSERT INTO employees (employee_id, name, phone, email, role, status)
-   VALUES (?,?,?,?,?,?)`,
-  ['ADM-0001', 'Bootstrap Admin', '9800000001', 'admin@demo-contractor.example',
-   ROLE.SUPER_ADMIN, EMPLOYEE_STATUS.ENROLMENT_PENDING],
-);
+await col('employees').insertOne({
+  _id: 'ADM-0001', name: 'Bootstrap Admin', phone: '9800000001',
+  email: 'admin@demo-contractor.example', role: ROLE.SUPER_ADMIN,
+  reports_to: null, status: EMPLOYEE_STATUS.ENROLMENT_PENDING, language: 'hi',
+  created_at: new Date(), updated_at: new Date(),
+});
 
 const admin = await signIn('ADM-0001');
 if (!admin.token) {
@@ -110,16 +111,17 @@ check(1, '2,000 clean rows accepted',
   clean.statusCode === 200 && cleanBody.created === 2000,
   `status ${clean.statusCode}, created ${cleanBody.created}, rejected ${cleanBody.rejected}`);
 
-const [{ n: storedClean }] = await query('SELECT COUNT(*) AS n FROM employees');
+const storedClean = await col('employees').countDocuments({});
 check(1, 'all 2,000 are actually in the database',
   storedClean === 2001, `${storedClean} rows (2,000 + the bootstrap admin)`);
 
 await reset();
-await query(
-  `INSERT INTO employees (employee_id, name, phone, email, role, status) VALUES (?,?,?,?,?,?)`,
-  ['ADM-0001', 'Bootstrap Admin', '9800000001', 'admin@demo-contractor.example',
-   ROLE.SUPER_ADMIN, EMPLOYEE_STATUS.ENROLMENT_PENDING],
-);
+await col('employees').insertOne({
+  _id: 'ADM-0001', name: 'Bootstrap Admin', phone: '9800000001',
+  email: 'admin@demo-contractor.example', role: ROLE.SUPER_ADMIN, reports_to: null,
+  status: EMPLOYEE_STATUS.ENROLMENT_PENDING, language: 'hi',
+  created_at: new Date(), updated_at: new Date(),
+});
 const admin2 = await signIn('ADM-0001');
 
 const dirtyCsv = await readFile(new URL('../fixtures/employees-2000-dirty.csv', import.meta.url), 'utf8');
@@ -152,8 +154,7 @@ const dupEmail = d.rejections.filter((r) =>
 check(1, 'two people cannot share an email address', dupEmail.length === 1,
   dupEmail[0]?.errors?.find((e) => /email/i.test(e)) ?? 'not rejected');
 
-const [{ n: withEmail }] = await query(
-  'SELECT COUNT(*) AS n FROM employees WHERE email IS NOT NULL AND email <> ?', ['']);
+const withEmail = await col('employees').countDocuments({ email: { $nin: [null, ''] } });
 check(1, 'emails imported for the staff who have one, blank for those who do not',
   withEmail > 50 && withEmail < 200, `${withEmail} of ${storedClean} have an email`);
 
@@ -164,9 +165,10 @@ const blockedRows = d.rejections.filter((r) => r.errors.some((e) => /Aadhaar/i.t
 check(2, 'Aadhaar-bearing rows were rejected',
   blockedRows.length === 2, `${blockedRows.length} rejected for Aadhaar`);
 
-const [{ n: aadhaarStored }] = await query(
-  `SELECT COUNT(*) AS n FROM employees WHERE employee_id REGEXP '^[0-9]{12}$'`,
-);
+// pramaan-guard:allow — this check EXISTS to prove no Aadhaar-shaped id was
+// stored. The MySQL version read as a destructuring pattern and slipped past
+// the guard; the Mongo rewrite is a plain assignment, so it needs the marker.
+const aadhaarStored = await col('employees').countDocuments({ _id: { $regex: /^[0-9]{12}$/ } }); // pramaan-guard:allow
 check(2, 'no 12-digit Aadhaar-shaped id reached the database', aadhaarStored === 0,
   `${aadhaarStored} found`);
 
@@ -192,16 +194,20 @@ const danglingRejections = d.rejections.filter((r) =>
 check(4, 'a senior who exists nowhere was reported by name',
   danglingRejections.length === 1, `${danglingRejections.length} rejected`);
 
-const [{ n: orphans }] = await query(
-  `SELECT COUNT(*) AS n FROM employees e
-    WHERE e.reports_to IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM employees s WHERE s.employee_id = e.reports_to)`,
-);
+// MySQL answered this with NOT EXISTS. There are no foreign keys now, so the
+// check matters MORE rather than less — it is the only thing standing where
+// fk_employees_reports_to used to.
+const orphans = (await col('employees').aggregate([
+  { $match: { reports_to: { $ne: null } } },
+  { $lookup: { from: 'employees', localField: 'reports_to', foreignField: '_id', as: 'senior' } },
+  { $match: { senior: { $size: 0 } } },
+  { $count: 'n' },
+]).toArray())[0]?.n ?? 0;
 check(4, 'no stored employee points at a senior who does not exist', orphans === 0,
   `${orphans} orphans`);
 
-const tree = await query('SELECT employee_id, reports_to FROM employees');
-const edges = new Map(tree.map((r) => [r.employee_id, r.reports_to]));
+const tree = await col('employees').find({}, { projection: { reports_to: 1 } }).toArray();
+const edges = new Map(tree.map((r) => [r._id, r.reports_to]));
 let cyclesInDb = 0;
 for (const start of edges.keys()) {
   const seen = new Set();
@@ -271,10 +277,8 @@ check(5, 'a senior cannot import either', seniorImport.statusCode === 403,
 // ── Criterion 6 ──────────────────────────────────────────────────────────
 console.log('\n\x1b[1m6. Sign in by phone, email or employee ID — one device at a time\x1b[0m');
 
-const [empRow] = await query(
-  'SELECT employee_id, phone, email FROM employees WHERE employee_id = ?', ['EMP-0100']);
-const [seniorRow] = await query(
-  'SELECT employee_id, phone, email FROM employees WHERE employee_id = ?', ['EMP-0006']);
+const empRow = await col('employees').findOne({ _id: 'EMP-0100' });
+const seniorRow = await col('employees').findOne({ _id: 'EMP-0006' });
 
 const byPhone = await signIn(empRow.phone);
 check(6, 'an employee signs in with their phone number',
@@ -322,8 +326,7 @@ check(6, 'the new phone is told which device it displaced',
 
 // The displaced phone may still be holding signed, unsent attendance, and
 // its key cannot move to the new handset. Hard-revoking would destroy it.
-const [displacedRow] = await query(
-  'SELECT state, reason FROM sessions WHERE session_id = ?', [firstPhone.session_id]);
+const displacedRow = await col('sessions').findOne({ _id: firstPhone.session_id });
 check(6, 'the displaced phone is DRAIN_ONLY, so unsent attendance is not lost',
   displacedRow?.state === 'DRAIN_ONLY' && displacedRow?.reason === 'SIGNED_IN_ELSEWHERE',
   `state ${displacedRow?.state}, reason ${displacedRow?.reason}`);
@@ -394,10 +397,9 @@ check(7, 'a new employee starts NOT registered — nobody is enrolled by a form'
   made.json().employee?.status === 'ENROLMENT_PENDING',
   `status ${made.json().employee?.status}`);
 
-const [{ n: attributed }] = await query(
-  'SELECT COUNT(*) AS n FROM import_batches WHERE imported_by = ? AND total_rows = 1',
-  ['ADM-0001'],
-);
+const attributed = await col('import_batches').countDocuments({
+  imported_by: 'ADM-0001', total_rows: 1,
+});
 check(7, 'who added them is recorded, exactly as an import is', attributed >= 1,
   `${attributed} single-row batches by ADM-0001`);
 
@@ -493,5 +495,5 @@ if (failed === 0) {
 console.log(`${'─'.repeat(60)}\n`);
 
 await app.close();
-await closePool();
+await closeClient();
 process.exit(failed === 0 ? 0 : 1);

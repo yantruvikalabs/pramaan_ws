@@ -30,7 +30,7 @@ import {
   embedCapture, embeddingAvailable, judgeStored, packEmbedding, qualityThresholds,
   unpackEmbedding,
 } from '../lib/embed.js';
-import { getPool, query } from '../db.js';
+import { col, getClient, CHAIN_TXN_OPTIONS } from '../db/mongo.js';
 
 /** FR-ENR-001 step 4: three captures, deliberately varied. */
 const REQUIRED_CAPTURES = 3;
@@ -158,11 +158,7 @@ export default function faceEnrolmentRoutes(app) {
         });
       }
 
-      const rows = await query(
-        'SELECT employee_id, name, status FROM employees WHERE employee_id = ?',
-        [employeeId],
-      );
-      const employee = rows[0];
+      const employee = await col('employees').findOne({ _id: employeeId });
       if (!employee) {
         return res.status(404).json({ error: 'NOT_FOUND', message: 'No such employee.' });
       }
@@ -282,14 +278,14 @@ export default function faceEnrolmentRoutes(app) {
       // the difference between "moved to a different window" and "did not move".
       const varied = spread === null ? null : spread >= 15;
 
-      const connection = await getPool().getConnection();
+      const session = getClient().startSession();
       try {
-        await connection.beginTransaction();
+        session.startTransaction(CHAIN_TXN_OPTIONS);
 
         // Re-enrolment replaces the template set. The Enrolled events both
         // remain in the chain, so the history of who enrolled this person and
         // when is never lost — only the biometric material is superseded.
-        await connection.execute('DELETE FROM face_templates WHERE employee_id = ?', [employeeId]);
+        await col('face_templates').deleteMany({ employee_id: employeeId }, { session });
 
         for (const r of usable) {
           // eslint-disable-next-line no-await-in-loop
@@ -303,32 +299,30 @@ export default function faceEnrolmentRoutes(app) {
             sharpness: raw.sharpness ?? null,
             off_centre: raw.off_centre ?? raw.offCentre ?? null,
           };
-          await connection.execute(
-            `INSERT INTO face_templates
-               (employee_id, capture_index, model, dimensions, embedding, channel, enrolled_by,
-                face_px, face_brightness, sharpness, off_centre, detector_score, advised_issues)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-            [
-              employeeId,
-              Number(r.index),
-              model,
-              Number(r.dimensions),
-              packEmbedding(r.embedding),
-              channel,
-              req.employee.employee_id,
-              // Kept so template quality can be correlated with match quality
-              // later — that correlation IS O-4, and it was being discarded.
-              Array.isArray(q.face_pixels) ? Math.min(...q.face_pixels) : null,
-              q.face_brightness ?? null,
-              q.sharpness ?? null,
-              q.off_centre ?? null,
-              r.detector_score ?? null,
-              // What the operator was told at the time. Empty string, not NULL,
-              // when the check was clean: NULL would be indistinguishable from
-              // "no check ran", and those mean different things.
-              Array.isArray(r.issues) ? r.issues.join(',').slice(0, 255) : null,
-            ],
-          );
+          await col('face_templates').insertOne({
+            employee_id: employeeId,
+            capture_index: Number(r.index),
+            model,
+            dimensions: Number(r.dimensions),
+            // A Node Buffer → BSON binData, and back to a Buffer on read
+            // because the client sets promoteBuffers:true. Without that flag
+            // lib/embed.js reads .length as a method and builds Array(NaN).
+            embedding: packEmbedding(r.embedding),
+            channel,
+            enrolled_by: req.employee.employee_id,
+            // Kept so template quality can be correlated with match quality
+            // later — that correlation IS O-4, and it was being discarded.
+            face_px: Array.isArray(q.face_pixels) ? Math.min(...q.face_pixels) : null,
+            face_brightness: q.face_brightness ?? null,
+            sharpness: q.sharpness ?? null,
+            off_centre: q.off_centre ?? null,
+            detector_score: r.detector_score ?? null,
+            // What the operator was told at the time. Empty string, not NULL,
+            // when the check was clean: NULL would be indistinguishable from
+            // "no check ran", and those mean different things.
+            advised_issues: Array.isArray(r.issues) ? r.issues.join(',').slice(0, 255) : null,
+            created_at: new Date(),
+          }, { session });
         }
 
         // The chain event inside the same transaction as the templates: if
@@ -356,15 +350,16 @@ export default function faceEnrolmentRoutes(app) {
             },
             captured_at: new Date().toISOString(),
           },
-          connection,
+          session,
         );
 
-        await connection.execute('UPDATE employees SET status = ? WHERE employee_id = ?', [
-          EMPLOYEE_STATUS.ENROLLED,
-          employeeId,
-        ]);
+        await col('employees').updateOne(
+          { _id: employeeId },
+          { $set: { status: EMPLOYEE_STATUS.ENROLLED, updated_at: new Date() } },
+          { session },
+        );
 
-        await connection.commit();
+        await session.commitTransaction();
 
         return res.status(201).json({
           employee_id: employeeId,
@@ -395,10 +390,10 @@ export default function faceEnrolmentRoutes(app) {
           },
         });
       } catch (err) {
-        await connection.rollback();
+        await session.abortTransaction().catch(() => {});
         throw err;
       } finally {
-        connection.release();
+        await session.endSession();
       }
     },
   );
@@ -421,11 +416,10 @@ export default function faceEnrolmentRoutes(app) {
    */
   app.get('/me/face-templates', requireAuth, async (req, res) => {
     const employeeId = req.employee.employee_id;
-    const rows = await query(
-      `SELECT capture_index, model, dimensions, embedding
-         FROM face_templates WHERE employee_id = ? ORDER BY capture_index`,
-      [employeeId],
-    );
+    const rows = await col('face_templates')
+      .find({ employee_id: employeeId })
+      .sort({ capture_index: 1 })
+      .toArray();
     if (rows.length === 0) {
       return res.json({ employee_id: employeeId, templates: 0, model: null, vectors: [] });
     }
@@ -459,13 +453,10 @@ export default function faceEnrolmentRoutes(app) {
     requireAuth,
     requireRole(ROLE.SENIOR),
     async (req, res) => {
-      const rows = await query(
-        `SELECT capture_index, model, dimensions, channel, enrolled_by, created_at,
-                face_px, face_brightness, sharpness, off_centre, detector_score,
-                advised_issues
-           FROM face_templates WHERE employee_id = ? ORDER BY capture_index`,
-        [req.params.id],
-      );
+      const rows = await col('face_templates')
+        .find({ employee_id: req.params.id }, { projection: { embedding: 0 } })
+        .sort({ capture_index: 1 })
+        .toArray();
 
       // A weak template set is otherwise invisible until somebody is turned away
       // at a gate. Surfaced here so a controller can re-enrol them first.

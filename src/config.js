@@ -39,6 +39,14 @@ export const config = {
     connectionLimit: Number(process.env.DB_POOL ?? 10),
   },
 
+  mongo: {
+    // Development defaults to the local single-node replica set on 27018.
+    // ⚠ A replica set is REQUIRED, not preferred: the chain appender needs
+    //   multi-document transactions, and a standalone mongod has none.
+    uri: process.env.MONGODB_URI ?? 'mongodb://127.0.0.1:27018/?replicaSet=rs0',
+    database: process.env.MONGODB_DB ?? 'pramaan',
+  },
+
   jwt: {
     // Dev fallback only. Startup refuses to run in production without a real one.
     secret: process.env.JWT_SECRET ?? 'dev-only-do-not-use-in-production',
