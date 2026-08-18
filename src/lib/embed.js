@@ -31,10 +31,9 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
-const API_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const API_ROOT = resolve(process.env.PRAMAAN_APP_ROOT ?? process.cwd());
 const REPO_ROOT = resolve(API_ROOT, '..', '..');
 
 const ML_DIR = process.env.PRAMAAN_ML_DIR ?? resolve(REPO_ROOT, 'ml');

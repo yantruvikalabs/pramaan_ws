@@ -1,7 +1,6 @@
 /** Configuration. Single tenant — one contractor, one deployment. FRD NFR-6. */
 
-import { fileURLToPath } from 'node:url';
-import { dirname, resolve, isAbsolute } from 'node:path';
+import { resolve, isAbsolute } from 'node:path';
 
 /**
  * Paths are resolved against the APPLICATION, never the working directory.
@@ -16,12 +15,7 @@ import { dirname, resolve, isAbsolute } from 'node:path';
  * directory and it silently mints a new key, and every record written before
  * that moment becomes unverifiable forever.
  */
-const appRoot = () => {
-  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT) return process.cwd();
-  return resolve(dirname(fileURLToPath(import.meta.url)), '..');
-};
-
-const APP_ROOT = appRoot();
+const APP_ROOT = resolve(process.env.PRAMAAN_APP_ROOT ?? process.cwd());
 const fromApp = (p) => (isAbsolute(p) ? p : resolve(APP_ROOT, p));
 const optionalPath = (name, fallback) => {
   const v = process.env[name];
