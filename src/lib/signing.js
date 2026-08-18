@@ -29,7 +29,7 @@ let cached = null;
  * backed up, and losing it means no new record can ever be appended to this
  * chain. assertProductionSafe() refuses to start without CHAIN_KEY_PATH set.
  *
- * CHAIN_SIGNING_KEY takes precedence over the file, and exists for hosts with
+ * CHAIN_PRIVATE_KEY_PEM takes precedence over the file, and exists for hosts with
  * no durable disk. On a serverless platform the file path is worse than
  * useless: each instance finds nothing there, generates its own key, and the
  * chain ends up signed by as many keys as the platform happened to start
@@ -39,12 +39,13 @@ let cached = null;
 export function signingKey() {
   if (cached) return cached;
 
-  const supplied = process.env.CHAIN_SIGNING_KEY;
+  const supplied = config.chain.privateKeyPem;
   if (supplied) {
-    // Accept both the raw PEM (newlines survive most dashboards) and base64,
-    // because which one a host mangles is not knowable in advance.
+    // Accept the raw PEM and base64 alike. Which of the two a dashboard
+    // mangles is not knowable in advance: some strip the newlines a PEM needs,
+    // some pass `\n` through literally, and base64 survives all of them.
     const pem = supplied.includes('-----BEGIN')
-      ? supplied.replace(/\\n/g, '\n')
+      ? supplied.replaceAll('\\n', '\n')
       : Buffer.from(supplied, 'base64').toString('utf8');
     return (cached = derive(pem));
   }

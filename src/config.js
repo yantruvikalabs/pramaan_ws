@@ -16,13 +16,17 @@ import { dirname, resolve, isAbsolute } from 'node:path';
  * directory and it silently mints a new key, and every record written before
  * that moment becomes unverifiable forever.
  */
-const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const fromApp = (p) => (isAbsolute(p) ? p : resolve(APP_ROOT, p));
+const appRoot = () => {
+  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT) return process.cwd();
+  return resolve(dirname(fileURLToPath(import.meta.url)), '..');
+};
 
-const required = (name, fallback) => {
-  const v = process.env[name] ?? fallback;
-  if (v === undefined) throw new Error(`Missing required env var: ${name}`);
-  return v;
+const APP_ROOT = appRoot();
+const fromApp = (p) => (isAbsolute(p) ? p : resolve(APP_ROOT, p));
+const optionalPath = (name, fallback) => {
+  const v = process.env[name];
+  if (v === '') return null;
+  return fromApp(v ?? fallback);
 };
 
 export const config = {
@@ -61,6 +65,7 @@ export const config = {
     // database alone must not be enough to forge a chain. Development
     // generates one on first run; production refuses to.
     keyPath: fromApp(process.env.CHAIN_KEY_PATH ?? '.data/chain-signing-key.pem'),
+    privateKeyPem: process.env.CHAIN_PRIVATE_KEY_PEM ?? null,
     // How many events one upload may carry. A phone that was offline for a
     // week has a few hundred; a request with fifty thousand is not a phone.
     maxBatch: Number(process.env.CHAIN_MAX_BATCH ?? 500),
@@ -70,7 +75,7 @@ export const config = {
     // A head recorded only in the database it protects is worthless. The
     // file sink gets it out of the database; the webhook gets it off the
     // machine and is the only one that is actually evidence.
-    headsFile: fromApp(process.env.CHAIN_HEADS_FILE ?? '.data/published-heads.jsonl'),
+    headsFile: optionalPath('CHAIN_HEADS_FILE', '.data/published-heads.jsonl'),
     headsWebhook: process.env.CHAIN_HEADS_WEBHOOK ?? null,
   },
 
@@ -129,13 +134,12 @@ export function assertProductionSafe() {
       'leaves this machine protects against nobody (FRD BR-EVD-21)',
     );
   }
-  if (!process.env.CHAIN_KEY_PATH && !process.env.CHAIN_SIGNING_KEY) {
+  if (!process.env.CHAIN_KEY_PATH && !process.env.CHAIN_PRIVATE_KEY_PEM) {
     // A key that appears by itself is a key nobody backed up, and losing it
     // means no new record can ever join this chain. Either source is fine —
     // what is refused is neither, which means the server would invent one.
     throw new Error(
-      'CHAIN_KEY_PATH or CHAIN_SIGNING_KEY must be set in production, and the key backed up',
+      'CHAIN_KEY_PATH or CHAIN_PRIVATE_KEY_PEM must be set in production, and the key backed up',
     );
   }
-  required('DB_PASSWORD');
 }

@@ -4,10 +4,10 @@
 # whole API is therefore one function, and every request is rewritten to it.
 
 [build]
-  # Nothing to compile — the API is plain ESM run as-is. `publish` still needs
-  # a directory, so it gets one holding a single explanatory page that only
-  # appears if the rewrite below ever stops matching.
-  command = "npm install --omit=dev"
+  # `build` is a syntax check, not a compile — the API is plain ESM run as-is.
+  # It exists so a typo in the function fails the deploy rather than every
+  # request afterwards.
+  command = "npm run build"
   publish = "public"
   functions = "netlify/functions"
 
@@ -18,8 +18,17 @@
   # produces a function that builds cleanly and fails on first connect.
   external_node_modules = ["mongodb"]
 
-# Every path, including /, goes to the API. `force` because the publish
-# directory would otherwise win for paths that happen to match a file.
+# Both base URLs work: `https://host` and `https://host/api`. The function
+# strips either prefix, so a client configured with one is not broken by the
+# other. `/api/*` is listed first because the catch-all would otherwise
+# swallow it and hand Express a path with the prefix still attached.
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+
+# Every remaining path, including `/`, is the API. `force` because the publish
+# directory would otherwise win for any path matching a file in it.
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/api/:splat"
