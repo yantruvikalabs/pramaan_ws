@@ -18,7 +18,7 @@
  */
 
 import { z } from 'zod';
-import { ROLE } from '@pramaan/shared';
+import { ROLE } from '../lib/vocabulary.js';
 import { requireAuth, requireAuthAllowingDrain, requireRole } from '../middleware/auth.js';
 import {
   appendEvent, quarantine, chainHead, readRange, verifyChain, isKnownType,

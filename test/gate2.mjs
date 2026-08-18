@@ -14,7 +14,7 @@ import { createHash } from 'node:crypto';
 import { startTestServer } from './harness.mjs';
 import { connect, col, closeClient } from '../src/db/mongo.js';
 import { applySchema, HEAD_ID, GENESIS_HASH } from '../src/db/mongo-schema.js';
-import { ROLE, EMPLOYEE_STATUS, EVENT_TYPE } from '@pramaan/shared';
+import { ROLE, EMPLOYEE_STATUS, EVENT_TYPE } from '../src/lib/vocabulary.js';
 
 const results = [];
 let app;

@@ -14,6 +14,7 @@
  * what a supervisor reaches for when helping somebody whose number changed.
  */
 
+import { OTP_CHANNEL } from './vocabulary.js';
 import { normalisePhone } from './phone.js';
 
 /**
@@ -57,11 +58,11 @@ export function classifyIdentifier(raw) {
 export function lookupFor(identifier) {
   switch (identifier.kind) {
     case 'EMAIL':
-      return { column: 'email', value: identifier.value, channel: 'EMAIL' };
+      return { column: 'email', value: identifier.value, channel: OTP_CHANNEL.EMAIL };
     case 'PHONE':
-      return { column: 'phone', value: identifier.value, channel: 'SMS' };
+      return { column: 'phone', value: identifier.value, channel: OTP_CHANNEL.SMS };
     default:
-      return { column: 'employee_id', value: identifier.value, channel: 'SMS' };
+      return { column: 'employee_id', value: identifier.value, channel: OTP_CHANNEL.SMS };
   }
 }
 

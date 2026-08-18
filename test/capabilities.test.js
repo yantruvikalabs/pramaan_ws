@@ -23,7 +23,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { capabilitiesFor } from '../src/lib/capabilities.js';
-import { ROLE } from '@pramaan/shared';
+import { ROLE } from '../src/lib/vocabulary.js';
 
 const EXPECTED_KEYS = [
   'importEmployees',

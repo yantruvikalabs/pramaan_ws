@@ -17,7 +17,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { EVENT_TYPES } from '@pramaan/shared';
+import { EVENT_TYPES } from './vocabulary.js';
 import { canonicalBytes, CANON_VERSION } from './canonical.js';
 import { sign, verify } from './signing.js';
 import { col, getClient, CHAIN_TXN_OPTIONS } from '../db/mongo.js';

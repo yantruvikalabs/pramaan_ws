@@ -22,7 +22,13 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { EMPLOYEE_STATUS, EVENT_TYPE, ROLE } from '@pramaan/shared';
+import {
+  EMPLOYEE_STATUS,
+  ENROLMENT_CHANNEL,
+  ENROLMENT_CHANNELS,
+  EVENT_TYPE,
+  ROLE,
+} from '../lib/vocabulary.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { appendEvent } from '../lib/chain.js';
 import { subjectRefFor } from '../lib/refs.js';
@@ -124,10 +130,10 @@ export default function faceEnrolmentRoutes(app) {
 
       const employeeId = req.params.id;
       const channel = String(req.body?.channel ?? '').toUpperCase();
-      if (channel !== 'WEB' && channel !== 'PHONE') {
+      if (!ENROLMENT_CHANNELS.includes(channel)) {
         return res.status(400).json({
           error: 'BAD_CHANNEL',
-          message: 'channel must be WEB or PHONE.',
+          message: `channel must be ${ENROLMENT_CHANNELS.join(' or ')}.`,
         });
       }
 
@@ -176,7 +182,7 @@ export default function faceEnrolmentRoutes(app) {
       // capture is turned into an embedding first, and only then is anything
       // stored (BR-ENR-1).
       const results = [];
-      if (channel === 'PHONE') {
+      if (channel === ENROLMENT_CHANNEL.PHONE) {
         // The app already embedded these with the Kotlin implementation, which
         // D-10 proves reproduces the normative Python byte-for-byte. Re-embedding
         // here would require the frame, and there is no reason for a worker's face

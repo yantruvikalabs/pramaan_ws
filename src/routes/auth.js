@@ -12,7 +12,7 @@
 
 import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
-import { WEB_ROLES } from '@pramaan/shared';
+import { OTP_CHANNEL, WEB_ROLES } from '../lib/vocabulary.js';
 import { capabilitiesFor } from '../lib/capabilities.js';
 import { classifyIdentifier, lookupFor, maskDestination } from '../lib/identity.js';
 import { sendCode } from '../lib/notify.js';
@@ -93,13 +93,14 @@ export default function authRoutes(app) {
     // are only knowable from the record, so returning one would turn this
     // box into a contact-details lookup for anyone holding an employee ID.
     const typed = classifyIdentifier(parsed.data.identifier);
-    const guessedChannel = typed?.kind === 'EMAIL' ? 'EMAIL' : 'SMS';
+    const guessedChannel =
+      typed?.kind === 'EMAIL' ? OTP_CHANNEL.EMAIL : OTP_CHANNEL.SMS;
 
     const generic = {
       sent: true,
       channel: guessedChannel,
       message:
-        guessedChannel === 'EMAIL'
+        guessedChannel === OTP_CHANNEL.EMAIL
           ? 'If that account exists, a code has been sent to that email address.'
           : 'If that account exists, a code has been sent by SMS.',
     };

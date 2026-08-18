@@ -1,7 +1,7 @@
 /**
  * Apply the MongoDB schema. Idempotent. Replaces db/migrate.js.
  *
- *   npm run db:migrate:mongo
+ *   npm run db:migrate
  *
  * Unlike the MySQL version there is no CREATE DATABASE step: MongoDB creates a
  * database when something is first written to it. What this does instead is

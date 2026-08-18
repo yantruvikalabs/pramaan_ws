@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { startTestServer } from './harness.mjs';
 import { connect, col, closeClient } from '../src/db/mongo.js';
 import { applySchema } from '../src/db/mongo-schema.js';
-import { ROLE, EMPLOYEE_STATUS } from '@pramaan/shared';
+import { ROLE, EMPLOYEE_STATUS } from '../src/lib/vocabulary.js';
 
 const results = [];
 let app;

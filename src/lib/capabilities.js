@@ -12,7 +12,7 @@
  * feature from every client, so the test pins the key set deliberately.
  */
 
-import { ROLE, roleAtLeast, WEB_ROLES, TEAM_ROLES } from '@pramaan/shared';
+import { ROLE, roleAtLeast, WEB_ROLES, TEAM_ROLES } from './vocabulary.js';
 
 export function capabilitiesFor(role) {
   return {

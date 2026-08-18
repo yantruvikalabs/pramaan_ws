@@ -8,7 +8,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { ROLE, ROLES, EMPLOYEE_STATUS, EVENT_TYPE, roleAtLeast } from '@pramaan/shared';
+import { ROLE, ROLES, EMPLOYEE_STATUS, EVENT_TYPE, roleAtLeast } from '../lib/vocabulary.js';
 import { appendEvent } from '../lib/chain.js';
 import { subjectRefFor } from '../lib/refs.js';
 import {

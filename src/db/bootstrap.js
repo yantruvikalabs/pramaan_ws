@@ -11,7 +11,7 @@
  */
 
 import { connect, col, closeClient } from './mongo.js';
-import { ROLE, EMPLOYEE_STATUS } from '@pramaan/shared';
+import { ROLE, EMPLOYEE_STATUS } from '../lib/vocabulary.js';
 import { normalisePhone } from '../lib/import.js';
 import { looksLikeAadhaar } from '../lib/aadhaar.js';
 

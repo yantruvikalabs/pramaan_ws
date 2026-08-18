@@ -28,14 +28,32 @@
  *   either appears.
  */
 
+import {
+  ROLES,
+  EMPLOYEE_STATUSES,
+  OTP_CHANNELS,
+  ENROLMENT_CHANNELS,
+} from '../lib/vocabulary.js';
 import { col, getDb } from './mongo.js';
+import { CHANNEL, SESSION_STATE, END_REASON } from '../lib/sessions.js';
 
 export const GENESIS_HASH =
   'sha256:0000000000000000000000000000000000000000000000000000000000000000';
 
 export const HEAD_ID = 'HEAD';
 
-const enumOf = (...values) => ({ enum: values });
+/**
+ * A validator's value set.
+ *
+ * ⚠ Every caller passes a frozen list from `../lib/vocabulary.js` or from the module
+ *   that owns the constant — NEVER a string literal typed out here. These lists
+ *   used to be retyped by hand, which meant the database held a second, silent
+ *   copy of the vocabulary: adding a role would pass every test and then be
+ *   rejected at write time by a validator nobody remembered to edit. Spreading
+ *   into a fresh array because MongoDB's driver serialises the value and a
+ *   frozen array is not ours to hand over.
+ */
+const enumOf = (values) => ({ enum: [...values] });
 
 /**
  * Collection definitions. `validator` is applied with moderate strictness:
@@ -57,9 +75,9 @@ export const COLLECTIONS = {
           name: { bsonType: 'string' },
           phone: { bsonType: 'string' },
           email: { bsonType: ['string', 'null'] },
-          role: enumOf('EMPLOYEE', 'SENIOR', 'ADMIN', 'SUPER_ADMIN'),
+          role: enumOf(ROLES),
           reports_to: { bsonType: ['string', 'null'] },
-          status: enumOf('ENROLMENT_PENDING', 'ENROLLED', 'INACTIVE'),
+          status: enumOf(EMPLOYEE_STATUSES),
           language: { bsonType: 'string' },
         },
       },
@@ -92,7 +110,7 @@ export const COLLECTIONS = {
         properties: {
           employee_id: { bsonType: 'string' },
           code_hash: { bsonType: 'string' },
-          channel: enumOf('SMS', 'EMAIL'),
+          channel: enumOf(OTP_CHANNELS),
           expires_at: { bsonType: 'date' },
           attempts: { bsonType: 'int' },
           consumed_at: { bsonType: ['date', 'null'] },
@@ -115,13 +133,10 @@ export const COLLECTIONS = {
         properties: {
           _id: { bsonType: 'string' },                    // session_id (uuid)
           employee_id: { bsonType: 'string' },
-          channel: enumOf('MOBILE', 'WEB'),
-          state: enumOf('ACTIVE', 'DRAIN_ONLY', 'REVOKED'),
+          channel: enumOf(Object.values(CHANNEL)),
+          state: enumOf(Object.values(SESSION_STATE)),
           reason: {
-            oneOf: [
-              enumOf('SIGNED_OUT', 'SIGNED_IN_ELSEWHERE', 'DEACTIVATED', 'EXPIRED'),
-              { bsonType: 'null' },
-            ],
+            oneOf: [enumOf(Object.values(END_REASON)), { bsonType: 'null' }],
           },
           last_seen_at: { bsonType: 'date' },
         },
@@ -228,7 +243,7 @@ export const COLLECTIONS = {
           // ⚠ NO IMAGE, EVER (BR-ENR-2). This is a little-endian float64
           //   vector and there is no column for a picture anywhere.
           embedding: { bsonType: 'binData' },
-          channel: enumOf('WEB', 'PHONE'),
+          channel: enumOf(ENROLMENT_CHANNELS),
         },
       },
     },

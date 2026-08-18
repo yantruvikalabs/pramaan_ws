@@ -15,7 +15,7 @@
  */
 
 import { parse } from 'csv-parse/sync';
-import { ROLES, ROLE, EMPLOYEE_STATUS, LANGUAGES, DEFAULT_LANGUAGE } from '@pramaan/shared';
+import { ROLES, ROLE, EMPLOYEE_STATUS, LANGUAGES, DEFAULT_LANGUAGE } from './vocabulary.js';
 import { looksLikeAadhaar, findBannedFieldNames } from './aadhaar.js';
 import { findCycles, findUnresolvedSeniors } from './tree.js';
 import { normalisePhone } from './phone.js';

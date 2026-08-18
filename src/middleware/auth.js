@@ -6,7 +6,7 @@
  */
 
 import jwt from 'jsonwebtoken';
-import { roleAtLeast } from '@pramaan/shared';
+import { roleAtLeast } from '../lib/vocabulary.js';
 import { config } from '../config.js';
 import { getEmployee } from '../lib/employee-store.js';
 import {
