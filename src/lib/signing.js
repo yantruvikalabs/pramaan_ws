@@ -32,6 +32,17 @@ let cached = null;
 export function signingKey() {
   if (cached) return cached;
 
+  if (config.chain.privateKeyPem) {
+    const pem = config.chain.privateKeyPem.replaceAll('\\n', '\n');
+    const publicKey = createPublicKey(pem);
+    cached = {
+      privatePem: pem,
+      publicKey,
+      publicSpkiB64: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
+    };
+    return cached;
+  }
+
   const path = config.chain.keyPath;
 
   if (!existsSync(path)) {

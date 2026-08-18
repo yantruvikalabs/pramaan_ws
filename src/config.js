@@ -18,11 +18,10 @@ import { dirname, resolve, isAbsolute } from 'node:path';
  */
 const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fromApp = (p) => (isAbsolute(p) ? p : resolve(APP_ROOT, p));
-
-const required = (name, fallback) => {
-  const v = process.env[name] ?? fallback;
-  if (v === undefined) throw new Error(`Missing required env var: ${name}`);
-  return v;
+const optionalPath = (name, fallback) => {
+  const v = process.env[name];
+  if (v === '') return null;
+  return fromApp(v ?? fallback);
 };
 
 export const config = {
@@ -61,6 +60,7 @@ export const config = {
     // database alone must not be enough to forge a chain. Development
     // generates one on first run; production refuses to.
     keyPath: fromApp(process.env.CHAIN_KEY_PATH ?? '.data/chain-signing-key.pem'),
+    privateKeyPem: process.env.CHAIN_PRIVATE_KEY_PEM ?? null,
     // How many events one upload may carry. A phone that was offline for a
     // week has a few hundred; a request with fifty thousand is not a phone.
     maxBatch: Number(process.env.CHAIN_MAX_BATCH ?? 500),
@@ -70,7 +70,7 @@ export const config = {
     // A head recorded only in the database it protects is worthless. The
     // file sink gets it out of the database; the webhook gets it off the
     // machine and is the only one that is actually evidence.
-    headsFile: fromApp(process.env.CHAIN_HEADS_FILE ?? '.data/published-heads.jsonl'),
+    headsFile: optionalPath('CHAIN_HEADS_FILE', '.data/published-heads.jsonl'),
     headsWebhook: process.env.CHAIN_HEADS_WEBHOOK ?? null,
   },
 
@@ -129,10 +129,11 @@ export function assertProductionSafe() {
       'leaves this machine protects against nobody (FRD BR-EVD-21)',
     );
   }
-  if (!process.env.CHAIN_KEY_PATH) {
+  if (!process.env.CHAIN_KEY_PATH && !process.env.CHAIN_PRIVATE_KEY_PEM) {
     // A key that appears by itself is a key nobody backed up, and losing it
     // means no new record can ever join this chain.
-    throw new Error('CHAIN_KEY_PATH must be set in production, and the key backed up');
+    throw new Error(
+      'CHAIN_KEY_PATH or CHAIN_PRIVATE_KEY_PEM must be set in production, and the key backed up',
+    );
   }
-  required('DB_PASSWORD');
 }
