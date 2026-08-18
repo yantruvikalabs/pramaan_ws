@@ -43,6 +43,8 @@ export const config = {
     //   multi-document transactions, and a standalone mongod has none.
     uri: process.env.MONGODB_URI ?? 'mongodb://127.0.0.1:27018/?replicaSet=rs0',
     database: process.env.MONGODB_DB ?? 'pramaan',
+    serverSelectionTimeoutMs: Number(process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS ?? 5_000),
+    connectTimeoutMs: Number(process.env.MONGODB_CONNECT_TIMEOUT_MS ?? 5_000),
   },
 
   jwt: {

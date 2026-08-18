@@ -24,6 +24,7 @@ const BODY_LIMIT = '20mb';
 
 export function buildApp(options = {}) {
   const app = express();
+  const includeHealthDatabaseProbe = options.healthDatabase !== false;
 
   app.disable('x-powered-by');
 
@@ -59,7 +60,9 @@ export function buildApp(options = {}) {
     // growing quarantine means events are being refused; a posture of NONE
     // means nothing about this chain is independently verifiable.
     let quarantined = null;
-    try { quarantined = await unreviewedQuarantine(); } catch { /* health must not fail on the DB */ }
+    if (includeHealthDatabaseProbe) {
+      try { quarantined = await unreviewedQuarantine(); } catch { /* health must not fail on the DB */ }
+    }
 
     res.json({
       ok: true,

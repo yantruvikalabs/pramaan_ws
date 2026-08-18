@@ -29,6 +29,11 @@ import { connect, assertDeploymentSupportsChain } from '../../src/db/mongo.js';
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
+// Built once, at module scope, and deliberately without the database probe in
+// /health. A health check that waits on Mongo cannot tell you Mongo is down —
+// on Lambda it just burns the function's timeout and returns nothing at all.
+const expressHandler = serverless(buildApp({ healthDatabase: false }));
+
 // Module scope, so a warm instance reuses the connection instead of opening
 // one per request. `ready` holds the PROMISE, deliberately not the result:
 // two concurrent invocations on the same instance must await the same connect.
@@ -53,8 +58,6 @@ async function boot() {
   // passes there — it is here to catch a URI pointed at something else.
   const deployment = await assertDeploymentSupportsChain();
   log.info({ replicaSet: deployment.replicaSet }, 'mongodb connected');
-
-  return serverless(buildApp());
 }
 
 /**
@@ -89,34 +92,42 @@ function normaliseEvent(event) {
   return normalised;
 }
 
+/** /health answers on its own. Everything else needs a database. */
+const isHealth = (event) => event.path === '/health' || event.rawPath === '/health';
+
 export async function handler(event, context) {
   // Lambda resolves the response before the connection pool is idle, and
   // waiting for it would add the pool teardown to every single request.
   if (context) context.callbackWaitsForEmptyEventLoop = false;
 
-  ready ??= boot();
+  const normalised = normaliseEvent(event);
 
-  let wrapped;
-  try {
-    wrapped = await ready;
-  } catch (err) {
-    // Retry on the next invocation rather than caching the failure for the
-    // life of the instance — a missing variable gets fixed in the dashboard,
-    // and Atlas comes back.
-    ready = null;
-    log.error({ err }, 'function failed to start');
-    return {
-      statusCode: 503,
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        error: 'NOT_CONFIGURED',
-        // The message names the missing variable, which is exactly what an
-        // attacker would like to know about a production deployment.
-        message:
-          config.env === 'production' ? 'The service is not available.' : err.message,
-      }),
-    };
+  // /health skips boot deliberately. The moment somebody looks at a health
+  // endpoint is the moment the database or the configuration is broken, so an
+  // endpoint that refuses to answer under exactly those conditions is useless.
+  if (!isHealth(normalised)) {
+    ready ??= boot();
+    try {
+      await ready;
+    } catch (err) {
+      // Retry on the next invocation rather than caching the failure for the
+      // life of the instance — a missing variable gets fixed in the dashboard,
+      // and Atlas comes back.
+      ready = null;
+      log.error({ err }, 'function failed to start');
+      return {
+        statusCode: 503,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          error: 'NOT_CONFIGURED',
+          // The message names the missing variable, which is exactly what an
+          // attacker would like to know about a production deployment.
+          message:
+            config.env === 'production' ? 'The service is not available.' : err.message,
+        }),
+      };
+    }
   }
 
-  return wrapped(normaliseEvent(event), context);
+  return expressHandler(normalised, context);
 }
