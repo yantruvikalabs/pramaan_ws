@@ -7,7 +7,7 @@ import { connect, assertDeploymentSupportsChain } from '../../src/db/mongo.js';
 assertProductionSafe();
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
-const app = buildApp();
+const app = buildApp({ healthDatabase: false });
 const expressHandler = serverless(app);
 
 let ready = null;
@@ -42,6 +42,9 @@ async function ensureReady() {
 }
 
 export async function handler(event, context) {
-  await ensureReady();
-  return expressHandler(normalizeEvent(event), context);
+  const normalized = normalizeEvent(event);
+  if (normalized.path !== '/health' && normalized.rawPath !== '/health') {
+    await ensureReady();
+  }
+  return expressHandler(normalized, context);
 }

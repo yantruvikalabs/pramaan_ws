@@ -51,7 +51,11 @@ let client = null;
 
 export function getClient() {
   if (client === null) {
-    client = new MongoClient(config.mongo.uri, REQUIRED_CLIENT_OPTIONS);
+    client = new MongoClient(config.mongo.uri, {
+      ...REQUIRED_CLIENT_OPTIONS,
+      serverSelectionTimeoutMS: config.mongo.serverSelectionTimeoutMs,
+      connectTimeoutMS: config.mongo.connectTimeoutMs,
+    });
   }
   return client;
 }
