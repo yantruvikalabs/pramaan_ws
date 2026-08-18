@@ -16,7 +16,12 @@ import { dirname, resolve, isAbsolute } from 'node:path';
  * directory and it silently mints a new key, and every record written before
  * that moment becomes unverifiable forever.
  */
-const APP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const appRoot = () => {
+  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT) return process.cwd();
+  return resolve(dirname(fileURLToPath(import.meta.url)), '..');
+};
+
+const APP_ROOT = appRoot();
 const fromApp = (p) => (isAbsolute(p) ? p : resolve(APP_ROOT, p));
 const optionalPath = (name, fallback) => {
   const v = process.env[name];
