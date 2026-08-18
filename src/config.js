@@ -129,10 +129,13 @@ export function assertProductionSafe() {
       'leaves this machine protects against nobody (FRD BR-EVD-21)',
     );
   }
-  if (!process.env.CHAIN_KEY_PATH) {
+  if (!process.env.CHAIN_KEY_PATH && !process.env.CHAIN_SIGNING_KEY) {
     // A key that appears by itself is a key nobody backed up, and losing it
-    // means no new record can ever join this chain.
-    throw new Error('CHAIN_KEY_PATH must be set in production, and the key backed up');
+    // means no new record can ever join this chain. Either source is fine —
+    // what is refused is neither, which means the server would invent one.
+    throw new Error(
+      'CHAIN_KEY_PATH or CHAIN_SIGNING_KEY must be set in production, and the key backed up',
+    );
   }
   required('DB_PASSWORD');
 }

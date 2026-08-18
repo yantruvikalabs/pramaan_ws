@@ -28,9 +28,26 @@ let cached = null;
  * Production never generates: a key that appears by itself is a key nobody
  * backed up, and losing it means no new record can ever be appended to this
  * chain. assertProductionSafe() refuses to start without CHAIN_KEY_PATH set.
+ *
+ * CHAIN_SIGNING_KEY takes precedence over the file, and exists for hosts with
+ * no durable disk. On a serverless platform the file path is worse than
+ * useless: each instance finds nothing there, generates its own key, and the
+ * chain ends up signed by as many keys as the platform happened to start
+ * processes — every one of them verifying against nothing. One key supplied
+ * as configuration is the only correct answer on such a host.
  */
 export function signingKey() {
   if (cached) return cached;
+
+  const supplied = process.env.CHAIN_SIGNING_KEY;
+  if (supplied) {
+    // Accept both the raw PEM (newlines survive most dashboards) and base64,
+    // because which one a host mangles is not knowable in advance.
+    const pem = supplied.includes('-----BEGIN')
+      ? supplied.replace(/\\n/g, '\n')
+      : Buffer.from(supplied, 'base64').toString('utf8');
+    return (cached = derive(pem));
+  }
 
   const path = config.chain.keyPath;
 
@@ -47,16 +64,18 @@ export function signingKey() {
     chmodSync(path, 0o600);
   }
 
-  const pem = readFileSync(path, 'utf8');
-  const publicKey = createPublicKey(pem);
+  return (cached = derive(readFileSync(path, 'utf8')));
+}
 
-  cached = {
+/** Everything the rest of the codebase needs, from one PEM. */
+function derive(pem) {
+  const publicKey = createPublicKey(pem);
+  return {
     privatePem: pem,
     publicKey,
     /** SPKI DER, base64 — what a verifier imports into WebCrypto. */
     publicSpkiB64: publicKey.export({ type: 'spki', format: 'der' }).toString('base64'),
   };
-  return cached;
 }
 
 /** Detached signature over the canonical bytes. */

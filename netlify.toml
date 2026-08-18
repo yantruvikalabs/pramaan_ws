@@ -1,0 +1,27 @@
+# Netlify configuration for the Pramaan API.
+#
+# Netlify serves static files or functions; it never runs `npm start`. The
+# whole API is therefore one function, and every request is rewritten to it.
+
+[build]
+  # Nothing to compile — the API is plain ESM run as-is. `publish` still needs
+  # a directory, so it gets one holding a single explanatory page that only
+  # appears if the rewrite below ever stops matching.
+  command = "npm install --omit=dev"
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+  # The driver loads optional native add-ons (kerberos, client-side field
+  # encryption) by name at runtime. esbuild cannot see those, and bundling it
+  # produces a function that builds cleanly and fails on first connect.
+  external_node_modules = ["mongodb"]
+
+# Every path, including /, goes to the API. `force` because the publish
+# directory would otherwise win for paths that happen to match a file.
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
