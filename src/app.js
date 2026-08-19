@@ -49,6 +49,26 @@ function configurationReport() {
     MONGODB_DB: process.env.MONGODB_DB ?? null,
     OTP_DELIVERY: config.otp.deliver,
     CORS_ORIGINS: config.corsOrigins,
+
+    // Everything above is OURS, and all of it being absent has two very
+    // different explanations that look identical from outside: the variables
+    // were never set on this site, or process.env does not work here at all
+    // (a bundler that inlined it would produce exactly the same nulls).
+    //
+    // These are the HOST's own variables. Nobody sets them by hand, so if
+    // they are present then process.env is fine and the missing values are a
+    // dashboard problem; if they are absent too, the problem is our build.
+    // SITE_NAME also settles the other open question outright — which site
+    // this function actually belongs to.
+    platform: {
+      env_var_count: Object.keys(process.env).length,
+      SITE_NAME: process.env.SITE_NAME ?? null,
+      URL: process.env.URL ?? null,
+      NETLIFY: process.env.NETLIFY ?? null,
+      AWS_REGION: process.env.AWS_REGION ?? null,
+      AWS_LAMBDA_FUNCTION_NAME: Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME),
+      DEPLOY_ID: Boolean(process.env.DEPLOY_ID),
+    },
   };
 }
 
