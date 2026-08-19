@@ -22,6 +22,36 @@ import { config } from './config.js';
 // A 2,000-row CSV is ~150 KB; 20 MB is ample.
 const BODY_LIMIT = '20mb';
 
+/**
+ * Which configuration actually reached this process. NAMES AND PRESENCE ONLY,
+ * never values.
+ *
+ * On a serverless host there is nothing to shell into, so a variable that was
+ * saved to the wrong scope looks exactly like one that was never saved, which
+ * looks exactly like a failed deploy. Without this the only way to tell them
+ * apart is to change something and redeploy, and that is a guess with a
+ * five-minute feedback loop.
+ *
+ * Withheld in production: /health is unauthenticated, and telling a stranger
+ * which secrets a server is missing tells them exactly where to push.
+ */
+function configurationReport() {
+  return {
+    // Booleans, because these three are secrets.
+    CHAIN_PRIVATE_KEY_PEM: Boolean(config.chain.privateKeyPem),
+    CHAIN_KEY_PATH: Boolean(process.env.CHAIN_KEY_PATH),
+    MONGODB_URI: Boolean(process.env.MONGODB_URI),
+    JWT_SECRET: !config.jwt.secret.startsWith('dev-only'),
+
+    // Values, because none of these are, and the value is the whole question:
+    // "OTP_DELIVERY is set" is useless, "OTP_DELIVERY is log" is the answer.
+    NODE_ENV: process.env.NODE_ENV ?? null,
+    MONGODB_DB: process.env.MONGODB_DB ?? null,
+    OTP_DELIVERY: config.otp.deliver,
+    CORS_ORIGINS: config.corsOrigins,
+  };
+}
+
 export function buildApp(options = {}) {
   const app = express();
   const includeHealthDatabaseProbe = options.healthDatabase !== false;
@@ -71,6 +101,7 @@ export function buildApp(options = {}) {
       phase: 2,
       quarantine_unreviewed: quarantined,
       publishing: publishingPosture().level,
+      ...(config.env === 'production' ? {} : { configured: configurationReport() }),
     });
   });
 
