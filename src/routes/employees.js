@@ -353,30 +353,6 @@ export default function employeeRoutes(app) {
     });
   });
 
-  /** GET /employees/:id — same visibility rule. */
-  app.get('/employees/:id', requireAuth, async (req, res) => {
-    const { role, employee_id: me } = req.employee;
-    const targetId = req.params.id;
-
-    const target = toEmployee(await col('employees').findOne({ _id: targetId }));
-    if (!target) {
-      return res.status(404).json({ error: 'NOT_FOUND', message: 'No such employee.' });
-    }
-
-    if (role !== ROLE.ADMIN && role !== ROLE.SUPER_ADMIN && targetId !== me) {
-      const all = await col('employees').find({}, { projection: { reports_to: 1 } }).toArray();
-      const edges = new Map(all.map((e) => [e._id, e.reports_to]));
-      if (!descendantsOf(me, edges).includes(targetId)) {
-        return res.status(403).json({
-          error: 'FORBIDDEN',
-          message: 'That employee is not in your team.',
-        });
-      }
-    }
-
-    return res.json({ employee: target });
-  });
-
   /** GET /employees/import/batches — the import history. */
   app.get(
     '/employees/import/batches',
@@ -417,4 +393,28 @@ export default function employeeRoutes(app) {
       });
     },
   );
+
+  /** GET /employees/:id — same visibility rule. */
+  app.get('/employees/:id', requireAuth, async (req, res) => {
+    const { role, employee_id: me } = req.employee;
+    const targetId = req.params.id;
+
+    const target = toEmployee(await col('employees').findOne({ _id: targetId }));
+    if (!target) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'No such employee.' });
+    }
+
+    if (role !== ROLE.ADMIN && role !== ROLE.SUPER_ADMIN && targetId !== me) {
+      const all = await col('employees').find({}, { projection: { reports_to: 1 } }).toArray();
+      const edges = new Map(all.map((e) => [e._id, e.reports_to]));
+      if (!descendantsOf(me, edges).includes(targetId)) {
+        return res.status(403).json({
+          error: 'FORBIDDEN',
+          message: 'That employee is not in your team.',
+        });
+      }
+    }
+
+    return res.json({ employee: target });
+  });
 }
