@@ -25,6 +25,8 @@ export function trustNetlifyClientIp() {
   netlifyClientIpTrusted = true;
 }
 
+/**test */
+
 /**
  * Read this per request, never at module load: the entry point cannot run
  * before the modules it imports have been evaluated, so a value captured at
