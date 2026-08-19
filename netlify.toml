@@ -17,7 +17,7 @@
   # serverless bundle; these server-only keys are intentionally present only at
   # runtime, so omit their values from this deploy-time comparison without
   # disabling smart detection or broader scanning.
-  SECRETS_SCAN_OMIT_KEYS = "MONGODB_URI,JWT_SECRET,CHAIN_PRIVATE_KEY_PEM,CORS_ORIGINS"
+  SECRETS_SCAN_OMIT_KEYS = "MONGODB_URI,JWT_SECRET,CHAIN_PRIVATE_KEY_PEM,CORS_ORIGINS,MONGODB_DB"
 
 [functions]
   node_bundler = "esbuild"
