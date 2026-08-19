@@ -106,12 +106,40 @@ function normaliseEvent(event) {
 /** /health answers on its own. Everything else needs a database. */
 const isHealth = (event) => event.path === '/health' || event.rawPath === '/health';
 
+function corsHeaders(event) {
+  const origin = event.headers?.origin ?? event.headers?.Origin;
+  if (!origin || !config.corsOrigins.includes(origin)) return {};
+
+  return {
+    'access-control-allow-origin': origin,
+    'access-control-allow-credentials': 'true',
+    vary: 'Origin',
+  };
+}
+
+function json(statusCode, body, event) {
+  return {
+    statusCode,
+    headers: {
+      'content-type': 'application/json',
+      ...corsHeaders(event),
+    },
+    body: JSON.stringify(body),
+  };
+}
+
 export async function handler(event, context) {
   // Lambda resolves the response before the connection pool is idle, and
   // waiting for it would add the pool teardown to every single request.
   if (context) context.callbackWaitsForEmptyEventLoop = false;
 
   const normalised = normaliseEvent(event);
+
+  // Browser preflights are answered by Express' CORS middleware. They should
+  // not be hidden behind the Mongo/config boot check for the real request.
+  if (normalised.httpMethod === 'OPTIONS' || normalised.requestContext?.http?.method === 'OPTIONS') {
+    return expressHandler(normalised, context);
+  }
 
   // /health skips boot deliberately. The moment somebody looks at a health
   // endpoint is the moment the database or the configuration is broken, so an
@@ -126,17 +154,17 @@ export async function handler(event, context) {
       // and Atlas comes back.
       ready = null;
       log.error({ err }, 'function failed to start');
-      return {
-        statusCode: 503,
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
+      return json(
+        503,
+        {
           error: 'NOT_CONFIGURED',
           // The message names the missing variable, which is exactly what an
           // attacker would like to know about a production deployment.
           message:
             config.env === 'production' ? 'The service is not available.' : err.message,
-        }),
-      };
+        },
+        normalised,
+      );
     }
   }
 

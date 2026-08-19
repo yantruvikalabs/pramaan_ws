@@ -2,7 +2,7 @@ node_modules/
 .DS_Store
 
 # Secrets. The Atlas password and the chain signing key live here.
-#.env
+.env
 .env.local
 .env.*.local
 
