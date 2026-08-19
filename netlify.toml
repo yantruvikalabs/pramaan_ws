@@ -11,6 +11,14 @@
   publish = "public"
   functions = "netlify/functions"
 
+[build.environment]
+  # The secrets themselves are supplied only by Netlify environment variables.
+  # Secret scanning compares those configured values against the generated
+  # serverless bundle; these server-only keys are intentionally present only at
+  # runtime, so omit their values from this deploy-time comparison without
+  # disabling smart detection or broader scanning.
+  SECRETS_SCAN_OMIT_KEYS = "MONGODB_URI,JWT_SECRET,CHAIN_PRIVATE_KEY_PEM,CORS_ORIGINS"
+
 [functions]
   node_bundler = "esbuild"
   # The driver loads optional native add-ons (kerberos, client-side field
