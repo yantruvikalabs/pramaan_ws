@@ -22,20 +22,21 @@
 
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { config } from '../config.js';
+import { isNetlifyClientIpTrusted } from '../lib/platform.js';
 
 /**
  * Netlify's edge sets this header and overwrites anything the caller sent, so
  * on Netlify it is trustworthy — which `x-forwarded-for` is not.
  *
- * It is read ONLY when we are actually running on Netlify. On any other host
- * nothing strips it, so a caller could send `x-nf-client-connection-ip` with a
+ * It is read ONLY when the Netlify entry point has said so — see lib/platform.js
+ * for why `process.env.NETLIFY` is not that signal. On any other host nothing
+ * strips this header, so a caller could send `x-nf-client-connection-ip` with a
  * fresh value on every request and walk straight past the limit.
  */
 const NETLIFY_CLIENT_IP_HEADER = 'x-nf-client-connection-ip';
-const onNetlify = process.env.NETLIFY === 'true';
 
 function clientIp(req) {
-  if (onNetlify) {
+  if (isNetlifyClientIpTrusted()) {
     const supplied = req.headers[NETLIFY_CLIENT_IP_HEADER];
     if (typeof supplied === 'string' && supplied.trim()) return supplied.trim();
   }

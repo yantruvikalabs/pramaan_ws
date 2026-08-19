@@ -10,6 +10,8 @@
  * · Rate limiting is per instance. `express-rate-limit` counts in memory, so
  *   the OTP flood ceiling is multiplied by however many instances Netlify
  *   happens to be running. Gate 1 checks that ceiling; it does not hold here.
+ *   It is at least counted PER CALLER — see trustNetlifyClientIp() below for
+ *   why that took an extra step, and what it looked like when it did not.
  * · CHAIN_PRIVATE_KEY_PEM must be set. Without it every instance generates its
  *   own key and the chain is signed by several — see lib/signing.js. The
  *   handler below refuses to serve rather than let that happen quietly.
@@ -26,8 +28,17 @@ import pino from 'pino';
 import { buildApp } from '../../src/app.js';
 import { config, assertProductionSafe } from '../../src/config.js';
 import { connect, assertDeploymentSupportsChain } from '../../src/db/mongo.js';
+import { trustNetlifyClientIp } from '../../src/lib/platform.js';
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' });
+
+// This file is the only thing Netlify executes, so this is the one place the
+// claim "we are on Netlify" is self-evidently true. It lets the rate limiter
+// believe `x-nf-client-connection-ip`, which Netlify's edge sets and a caller
+// cannot forge. Without it every request looks like the same anonymous caller
+// and twenty of them lock every employee out of sign-in — see
+// middleware/rate-limit.js.
+trustNetlifyClientIp();
 
 // Built once, at module scope, and deliberately without the database probe in
 // /health. A health check that waits on Mongo cannot tell you Mongo is down —
